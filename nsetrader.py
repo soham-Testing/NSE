@@ -3623,6 +3623,34 @@ def _power_scan_52w_recovery(period, top_n, use_smp=False):
     picks.sort(key=lambda x: -x["opp_score"])
     return picks[:top_n], {}, nifty, ""
 
+# ── Cloud-safe tracker: use st.session_state as fallback ─────────────────────
+def _tracker_load() -> list:
+    """Load signals — checks session_state first, then file."""
+    if _STREAMLIT and "tracker_data" in st.session_state:
+        return list(st.session_state["tracker_data"])
+    try:
+        _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if _TRACKER_FILE.exists():
+            with open(_TRACKER_FILE, "r") as f:
+                data = json.load(f)
+            result = data if isinstance(data, list) else []
+            if _STREAMLIT:
+                st.session_state["tracker_data"] = result
+            return result
+    except Exception:
+        pass
+    return []
+
+def _tracker_save(records: list) -> None:
+    """Save signals — writes to file AND session_state."""
+    if _STREAMLIT:
+        st.session_state["tracker_data"] = list(records)
+    try:
+        _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_TRACKER_FILE, "w") as f:
+            json.dump(records, f, indent=2, default=str)
+    except Exception:
+        pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIGNAL TRACKER — persistent JSON store for all generated signals
