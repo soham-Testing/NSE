@@ -1990,11 +1990,12 @@ def run(cfg:Cfg)->tuple:
             .reset_index(drop=True))
     LOG.info("Loaded %d bars across %d symbols.",len(prices),prices["symbol"].nunique())
 
-    def _inject(grp):
-        sym=grp["symbol"].iloc[0]; fd=fund_cache.get(sym,{})
-        grp["_pe"]=fd.get("pe") or 0.0; grp["_roe"]=fd.get("roe") or 0.0
-        grp["_epsg"]=fd.get("eps_g") or 0.0; return grp
-    prices=prices.groupby("symbol",group_keys=False).apply(_inject).reset_index(drop=True)
+    # Pandas 2.2+ drops groupby key column in apply — use direct map instead
+    def _get_fund(sym, field, default=0.0):
+        return fund_cache.get(sym, {}).get(field) or default
+    prices["_pe"]   = prices["symbol"].map(lambda s: _get_fund(s, "pe",    0.0))
+    prices["_roe"]  = prices["symbol"].map(lambda s: _get_fund(s, "roe",   0.0))
+    prices["_epsg"] = prices["symbol"].map(lambda s: _get_fund(s, "eps_g", 0.0))
 
     if _HAS_RICH: _con.print("[dim]⚙️  Computing 45+ indicators per symbol...[/dim]")
     feat=engineer_all(prices,cfg)
@@ -3623,34 +3624,6 @@ def _power_scan_52w_recovery(period, top_n, use_smp=False):
     picks.sort(key=lambda x: -x["opp_score"])
     return picks[:top_n], {}, nifty, ""
 
-# ── Cloud-safe tracker: use st.session_state as fallback ─────────────────────
-def _tracker_load() -> list:
-    """Load signals — checks session_state first, then file."""
-    if _STREAMLIT and "tracker_data" in st.session_state:
-        return list(st.session_state["tracker_data"])
-    try:
-        _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if _TRACKER_FILE.exists():
-            with open(_TRACKER_FILE, "r") as f:
-                data = json.load(f)
-            result = data if isinstance(data, list) else []
-            if _STREAMLIT:
-                st.session_state["tracker_data"] = result
-            return result
-    except Exception:
-        pass
-    return []
-
-def _tracker_save(records: list) -> None:
-    """Save signals — writes to file AND session_state."""
-    if _STREAMLIT:
-        st.session_state["tracker_data"] = list(records)
-    try:
-        _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(_TRACKER_FILE, "w") as f:
-            json.dump(records, f, indent=2, default=str)
-    except Exception:
-        pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SIGNAL TRACKER — persistent JSON store for all generated signals
