@@ -3629,11 +3629,110 @@ def _power_scan_52w_recovery(period, top_n, use_smp=False):
 # SIGNAL TRACKER — persistent JSON store for all generated signals
 # ══════════════════════════════════════════════════════════════════════════════
 
-_TRACKER_FILE = Path("nse_v10_output") / "signal_tracker.json"
+_TRACKER_FILE   = Path("nse_v10_output") / "signal_tracker.json"
 _TRACKER_CUTOFF = "2026-03-20"   # Track signals from this date onwards
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENCE: GitHub Gist (cloud) → local file (fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+# On Streamlit Cloud the filesystem is ephemeral — data is lost on restart.
+# Solution: store tracker JSON in a GitHub Gist via the GitHub API.
+# The Gist ID and Personal Access Token are read from st.secrets (set once
+# in the Streamlit Cloud dashboard under Settings → Secrets).
+#
+# st.secrets required keys:
+#   [gist]
+#   token   = "ghp_xxxxxxxxxxxxxxxxxxxx"   ← GitHub PAT (repo + gist scope)
+#   gist_id = "abcdef1234567890abcdef"     ← ID of a Gist you created
+#
+# If secrets are absent the app silently falls back to local file storage
+# (works fine for local development).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gist_token() -> str | None:
+    try:
+        return st.secrets["gist"]["token"]
+    except Exception:
+        return None
+
+def _gist_id() -> str | None:
+    try:
+        return st.secrets["gist"]["gist_id"]
+    except Exception:
+        return None
+
+_GIST_FILENAME = "nse_signal_tracker.json"
+
+def _gist_load() -> list | None:
+    """Fetch tracker JSON from GitHub Gist. Returns None on failure."""
+    import requests as _rq
+    token = _gist_token(); gid = _gist_id()
+    if not token or not gid:
+        return None
+    try:
+        r = _rq.get(
+            f"https://api.github.com/gists/{gid}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github.v3+json"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            files = r.json().get("files", {})
+            f     = files.get(_GIST_FILENAME)
+            if f:
+                raw_url = f.get("raw_url")
+                if raw_url:
+                    raw = _rq.get(raw_url, timeout=10)
+                    if raw.status_code == 200:
+                        data = raw.json()
+                        return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return None
+
+def _gist_save(records: list) -> bool:
+    """Push tracker JSON to GitHub Gist. Returns True on success."""
+    import requests as _rq
+    token = _gist_token(); gid = _gist_id()
+    if not token or not gid:
+        return False
+    try:
+        payload = {
+            "files": {
+                _GIST_FILENAME: {
+                    "content": json.dumps(records, indent=2, default=str)
+                }
+            }
+        }
+        r = _rq.patch(
+            f"https://api.github.com/gists/{gid}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github.v3+json"},
+            json=payload,
+            timeout=15,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
 def _tracker_load() -> list:
-    """Load all tracked signals from JSON file."""
+    """
+    Load tracked signals.
+    Priority: (1) Gist cloud storage  (2) local JSON file  (3) empty list
+    """
+    # 1. Try Gist (Streamlit Cloud deployment)
+    gist_data = _gist_load()
+    if gist_data is not None:
+        # Mirror to local file so local dev also has the data
+        try:
+            _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_TRACKER_FILE, "w") as f:
+                json.dump(gist_data, f, indent=2, default=str)
+        except Exception:
+            pass
+        return gist_data
+
+    # 2. Fall back to local file
     try:
         _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
         if _TRACKER_FILE.exists():
@@ -3645,7 +3744,14 @@ def _tracker_load() -> list:
     return []
 
 def _tracker_save(records: list) -> None:
-    """Save tracked signals to JSON file."""
+    """
+    Save tracked signals.
+    Writes to Gist (if configured) AND local file (always).
+    """
+    # 1. Save to Gist first (cloud persistence)
+    _gist_save(records)
+
+    # 2. Always write local file (for local dev + as cache)
     try:
         _TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(_TRACKER_FILE, "w") as f:
@@ -7251,6 +7357,109 @@ def run_dashboard(alerts_in, bt_in, nifty_in, feat_df_in):
 
         # ── Load tracked signals ──────────────────────────────────────────
         _tracked = _tracker_load()
+
+        # ── Import / Export panel (cloud data migration) ─────────────────
+        with st.expander("📤 Import / Export — Backup & Restore Tracker Data", expanded=False):
+            _ie1, _ie2 = st.columns(2)
+
+            with _ie1:
+                st.markdown(
+                    "<div style='font-size:.78rem;color:#787b86;padding:4px 0 8px'>"
+                    "<b style='color:#d1d4dc'>Export</b> — download all your tracked signals "
+                    "as JSON. Use this to back up before redeployment or move data between devices."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                if _tracked:
+                    _export_bytes = json.dumps(_tracked, indent=2, default=str).encode()
+                    st.download_button(
+                        "⬇️ Download tracker.json",
+                        data=_export_bytes,
+                        file_name=f"tracker_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                        mime="application/json",
+                        use_container_width=True,
+                        key="export_json",
+                    )
+                    # Connection status
+                    _has_gist = bool(_gist_token() and _gist_id())
+                    st.markdown(
+                        f"<div style='font-size:.7rem;margin-top:6px;padding:5px 8px;"
+                        f"background:{'#26a69a15' if _has_gist else '#ef535015'};"
+                        f"border-radius:3px;color:{'#26a69a' if _has_gist else '#ef5350'}'>"
+                        f"{'✅ Gist storage active — data persists across restarts' if _has_gist else '⚠️ No Gist configured — data will be lost on restart. See setup guide below.'}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.info("No signals to export yet.", icon="📭")
+
+            with _ie2:
+                st.markdown(
+                    "<div style='font-size:.78rem;color:#787b86;padding:4px 0 8px'>"
+                    "<b style='color:#d1d4dc'>Import</b> — upload a previously exported "
+                    "<code>tracker.json</code> to restore your signals. This <b>merges</b> "
+                    "with existing data (deduplicates by symbol + date)."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+                _up_file = st.file_uploader(
+                    "Upload tracker.json", type=["json"],
+                    key="import_json", label_visibility="collapsed",
+                )
+                if _up_file:
+                    try:
+                        _import_data = json.load(_up_file)
+                        if not isinstance(_import_data, list):
+                            st.error("Invalid file — must be a JSON array.")
+                        else:
+                            _existing_keys = {(r["symbol"], r.get("scan_date","")) for r in _tracked}
+                            _added = 0
+                            for _ir in _import_data:
+                                _ik = (_ir.get("symbol",""), _ir.get("scan_date",""))
+                                if _ik not in _existing_keys:
+                                    _tracked.append(_ir)
+                                    _existing_keys.add(_ik)
+                                    _added += 1
+                            if _added > 0:
+                                _tracker_save(_tracked)
+                                st.success(f"✅ Imported {_added} new signals ({len(_import_data) - _added} duplicates skipped).")
+                                st.rerun()
+                            else:
+                                st.info("All signals in the file are already in the tracker.")
+                    except Exception as _ie_err:
+                        st.error(f"Error reading file: {_ie_err}")
+
+            # Gist setup guide
+            if not (_gist_token() and _gist_id()):
+                st.markdown("""---
+                <div style='font-size:.76rem;color:#787b86;line-height:1.8'>
+                <b style='color:#f59e0b'>⚠️ Gist not configured — your tracker data will be lost when the app restarts.</b><br>
+                To enable permanent storage, follow these 3 steps:
+                </div>""", unsafe_allow_html=True)
+                st.markdown("""
+**Step 1 — Create a GitHub Gist:**
+1. Go to [gist.github.com](https://gist.github.com)
+2. Create a new **secret** gist
+3. Filename: `nse_signal_tracker.json`, Content: `[]`
+4. Click **Create secret gist**
+5. Copy the **Gist ID** from the URL: `gist.github.com/username/`**`THIS_PART`**
+
+**Step 2 — Create a GitHub Personal Access Token (PAT):**
+1. GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+2. Click **Generate new token (classic)**
+3. Tick **`gist`** scope only
+4. Click **Generate token** and copy it immediately
+
+**Step 3 — Add to Streamlit Cloud Secrets:**
+1. Streamlit Cloud → your app → **Settings** → **Secrets**
+2. Paste exactly:
+```toml
+[gist]
+token   = "ghp_your_token_here"
+gist_id = "your_gist_id_here"
+```
+3. Click **Save** — app restarts and data is now permanent ✅
+""")
 
         # ═══════════════════════════════════════════════════════════════════
         # ADD / REMOVE PANEL
