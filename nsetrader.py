@@ -3649,17 +3649,35 @@ _TRACKER_CUTOFF = "2026-03-20"   # Track signals from this date onwards
 # (works fine for local development).
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _gist_token() -> str | None:
+def _gist_token():
+    """Read token from st.secrets — tries nested [gist] section AND flat keys."""
     try:
-        return st.secrets["gist"]["token"]
+        # Format 1 (correct): [gist] section → token = "..."
+        v = st.secrets.get("gist", {}).get("token")
+        if v: return str(v).strip()
     except Exception:
-        return None
+        pass
+    try:
+        # Format 2 (flat): token = "..." at root level
+        v = st.secrets.get("token")
+        if v: return str(v).strip()
+    except Exception:
+        pass
+    return None
 
-def _gist_id() -> str | None:
+def _gist_id():
+    """Read gist_id from st.secrets — tries nested [gist] section AND flat keys."""
     try:
-        return st.secrets["gist"]["gist_id"]
+        v = st.secrets.get("gist", {}).get("gist_id")
+        if v: return str(v).strip()
     except Exception:
-        return None
+        pass
+    try:
+        v = st.secrets.get("gist_id")
+        if v: return str(v).strip()
+    except Exception:
+        pass
+    return None
 
 _GIST_FILENAME = "nse_signal_tracker.json"
 
