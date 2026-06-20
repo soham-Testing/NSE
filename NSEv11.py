@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
-║  NSE SWING TRADER  v12.0  ·  DUAL ENGINE                                          ║
-║  Engine A: Swing Trades (2–20 days, ATR stops, vol targeting)                      ║
-║  Engine B: Multibagger Discovery (3–10 year, fundamental deep scan)                ║
-║  Production fixes: No lookahead, realistic fills, correlation guard, survivorship   ║
+║  NSE SWING TRADER  v13.0  ·  THREE-HORIZON INTELLIGENCE ENGINE                    ║
+║  Short (2–7D) · Mid (1–3M) · Long (6–12M+)                                       ║
+║  Verdict: BUY / AVOID / WATCH / WAIT  ·  Strategy Attribution Analytics            ║
+║  Production: No lookahead, realistic fills, vol targeting, correlation guard       ║
 ╚══════════════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from math import sqrt
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple, Any, Set
 
 import numpy as np
 import pandas as pd
@@ -48,7 +48,7 @@ _STREAMLIT = _is_streamlit()
 
 if _STREAMLIT:
     import streamlit as st
-    st.set_page_config(page_title="NSE Swing + Multibagger v12", page_icon="📈",
+    st.set_page_config(page_title="NSE Three-Horizon Trader v13", page_icon="📈",
                        layout="wide", initial_sidebar_state="expanded")
 
 try:
@@ -77,9 +77,10 @@ if not _STREAMLIT:
 
 if _STREAMLIT:
     import plotly.graph_objects as go
+    import plotly.express as px
     import streamlit.components.v1 as components
 
-LOG = logging.getLogger("NSEv12")
+LOG = logging.getLogger("NSEv13")
 for _nm in ("yfinance","urllib3","requests","charset_normalizer"):
     logging.getLogger(_nm).setLevel(logging.CRITICAL)
 
@@ -194,19 +195,37 @@ def yf_ticker(sym: str) -> str:
     return f"{_YF_OVERRIDE.get(sym, sym)}.NS"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §2  CONFIG
+# §2  CONFIG  (Three Horizon Configs)
 # ══════════════════════════════════════════════════════════════════════════════
+@dataclass
+class HorizonCfg:
+    name: str = "swing"
+    label: str = "Swing (2–7 Days)"
+    ema_fast: int = 9
+    ema_slow: int = 21
+    ema_trend: int = 50
+    atr_sl_mult: float = 0.8
+    atr_tp_mult: float = 1.5
+    max_hold: int = 7
+    min_hold: int = 2
+    threshold: float = 0.20
+    weights: dict = field(default_factory=lambda: {
+        "momentum":0.30,"volume":0.25,"breakout":0.20,"pattern":0.15,"trend":0.10
+    })
+    min_rr: float = 1.0
+    description: str = "Fast momentum, volume surge, tight stops"
+
 @dataclass
 class Cfg:
     live_period: str = "8mo"
     live_interval: str = "1d"
-    output_dir: Path = Path("nse_v12_output")
+    output_dir: Path = Path("nse_v13_output")
     fetch_fundamentals: bool = True
     symbols: List[str] = field(default_factory=list)
-    min_avg_vol: int = 750_000
+    min_avg_vol: int = 500_000
     min_price: float = 30.0
     min_traded_val_cr: float = 2.0
-    top_n: int = 10
+    top_n: int = 12
     ema_spans: tuple = (9, 21, 50, 200)
     rsi_period: int = 14
     atr_period: int = 14
@@ -234,17 +253,40 @@ class Cfg:
     bt_pos_pct: float = 0.20
     bt_risk_per_trade: float = 0.01
     bt_max_correlation: float = 0.70
-    bt_use_atr_stops: bool = True
     bt_slip_bps: float = 5.0
     bt_cost_bps: float = 12.0
     bt_max_hold: int = 12
     bt_min_hold: int = 2
     # Display
     capital: float = 1_000_000.0
-    # Multibagger
-    mb_max_mcap_cr: float = 50_000.0
-    mb_min_score: float = 55.0
-    mb_top_n: int = 15
+    # Three horizons
+    short_cfg: HorizonCfg = field(default_factory=lambda: HorizonCfg(
+        name="short", label="Short Term (2–7 Days)",
+        ema_fast=9, ema_slow=21, ema_trend=50,
+        atr_sl_mult=0.8, atr_tp_mult=1.5, max_hold=7, min_hold=2,
+        threshold=0.22,
+        weights={"momentum":0.30,"volume":0.25,"breakout":0.20,"pattern":0.15,"trend":0.10},
+        min_rr=1.0,
+        description="Fast momentum plays. Tight 0.8× ATR stops. 2–7 day holds."
+    ))
+    mid_cfg: HorizonCfg = field(default_factory=lambda: HorizonCfg(
+        name="mid", label="Mid Term (1–3 Months)",
+        ema_fast=21, ema_slow=50, ema_trend=200,
+        atr_sl_mult=1.5, atr_tp_mult=2.5, max_hold=45, min_hold=10,
+        threshold=0.18,
+        weights={"trend":0.30,"breakout":0.25,"pullback":0.20,"volume":0.15,"momentum":0.10},
+        min_rr=1.5,
+        description="Trend continuation & breakouts. 1.5× ATR stops. 1–3 month holds."
+    ))
+    long_cfg: HorizonCfg = field(default_factory=lambda: HorizonCfg(
+        name="long", label="Long Term (6–12+ Months)",
+        ema_fast=50, ema_slow=200, ema_trend=200,
+        atr_sl_mult=2.5, atr_tp_mult=5.0, max_hold=252, min_hold=60,
+        threshold=0.14,
+        weights={"trend":0.35,"fundamental":0.25,"volume":0.15,"breakout":0.15,"momentum":0.10},
+        min_rr=2.0,
+        description="Major trend & fundamental plays. Wide 2.5× ATR stops. 6–12 month holds."
+    ))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §3  DATA LAYER
@@ -450,6 +492,7 @@ def compute_indicators(raw: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
     df["vol_z"] = ((v-df["avg_vol20"])/v.rolling(20, min_periods=10).std().replace(0,np.nan)).fillna(0)
     df["med_tv20"] = (c*v).rolling(20, min_periods=10).median()
     df["ret1"] = c.pct_change(); df["ret5"] = c.pct_change(5); df["ret20"] = c.pct_change(20)
+    df["ret60"] = c.pct_change(60)
     df["hi20"] = h.shift(1).rolling(cfg.breakout_window, min_periods=8).max()
     df["lo20"] = l.shift(1).rolling(cfg.breakout_window, min_periods=8).min()
     df["hi50"] = h.shift(1).rolling(50, min_periods=15).max()
@@ -458,7 +501,9 @@ def compute_indicators(raw: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
     df["n52h"] = (c>=df["hi52"]*0.97).astype(int); df["n52l"] = (c<=df["lo52"]*1.03).astype(int)
     df["bo_d"] = (c/df["hi20"].replace(0,np.nan)-1)*100; df["bd_d"] = (c/df["lo20"].replace(0,np.nan)-1)*100
     df["pull_slow"] = (c/df["ema21"].replace(0,np.nan)-1)*100
-    # ── STRICT SWING PATTERNS (5 only) ──
+    df["pull_mid"] = (c/df["ema50"].replace(0,np.nan)-1)*100
+    df["pull_long"] = (c/df["ema200"].replace(0,np.nan)-1)*100
+    # Strict patterns
     po=o.shift(1); pc_=c.shift(1); ph=h.shift(1); pl=l.shift(1)
     body=(c-o).abs(); rng_=(h-l).replace(0,np.nan)
     ls=df[["open","close"]].min(axis=1)-l; us=h-df[["open","close"]].max(axis=1)
@@ -480,227 +525,326 @@ def engineer_all(prices: pd.DataFrame, cfg: Cfg) -> pd.DataFrame:
     return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §5  PATTERN ENGINE  (5 strict patterns, volume-confirmed)
+# §5  THREE-HORIZON SCORING & VERDICT ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-def _g(row,k:str,d:float=0.0)->float:
-    try: v=row[k] if isinstance(row,dict) else getattr(row,k,d)
-    except Exception: return d
-    if v is None or (isinstance(v,float) and np.isnan(v)): return d
+
+def _g(row, k: str, d: float = 0.0) -> float:
+    try:
+        v = row[k] if isinstance(row, dict) else getattr(row, k, d)
+    except Exception:
+        return d
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return d
     return float(v)
 
-def detect_patterns(row,tail:pd.DataFrame)->List[Tuple[float,str,str]]:
-    hits:Dict[str,Tuple]={}
-    def add(sc,lb,cat):
-        if lb not in hits or sc>hits[lb][0]: hits[lb]=(sc,lb,cat)
-    prev=tail.iloc[-2] if len(tail)>=2 else row
-    c=_g(row,"close"); e9=_g(row,"ema9"); e21=_g(row,"ema21")
-    e50=_g(row,"ema50"); e200=_g(row,"ema200",e50)
-    rsi=_g(row,"rsi14",50); mh=_g(row,"macd_h")
-    atr=_g(row,"atr14",c*0.02) or c*0.02
-    vol=_g(row,"vol_ratio",1.0); adx=_g(row,"adx",20)
-    stk=_g(row,"stoch_k",50); std_=_g(row,"stoch_d",50)
-    bbp=_g(row,"bb_pct",0.5); st=_g(row,"st_dir",0); stf=_g(row,"st_flip",0)
-    obv=_g(row,"obv",0); obve=_g(row,"obv_ema",0)
-    pdi=_g(row,"plus_di",0); mdi=_g(row,"minus_di",0)
-    pull=_g(row,"pull_slow",0)
-    pc=_g(prev,"close"); pe9=_g(prev,"ema9"); pe21=_g(prev,"ema21")
-    pmh=_g(prev,"macd_h"); prsi=_g(prev,"rsi14",50)
-    pstk=_g(prev,"stoch_k",50); pbbp=_g(prev,"bb_pct",0.5)
-    pobv=_g(prev,"obv",0); pst=_g(prev,"st_dir",0)
+def score_horizon(row, hcfg: HorizonCfg, fund: dict = None) -> Tuple[float, List[Tuple[float,str,str]], dict]:
+    """Score a stock for a specific horizon. Returns (score, hits, factor_scores)."""
+    c = _g(row, "close")
+    e_fast = _g(row, f"ema{hcfg.ema_fast}")
+    e_slow = _g(row, f"ema{hcfg.ema_slow}")
+    e_trend = _g(row, f"ema{hcfg.ema_trend}", e_slow)
+    rsi = _g(row, "rsi14", 50)
+    mh = _g(row, "macd_h")
+    atr = _g(row, "atr14", c*0.02) or c*0.02
+    vol = _g(row, "vol_ratio", 1.0)
+    adx = _g(row, "adx", 20)
+    st = _g(row, "st_dir", 0)
+    stf = _g(row, "st_flip", 0)
+    bbp = _g(row, "bb_pct", 0.5)
+    bo20 = _g(row, "bo20", 0)
+    bo50 = _g(row, "bo50", 0)
+    ret5 = _g(row, "ret5", 0)
+    ret20 = _g(row, "ret20", 0)
+    ret60 = _g(row, "ret60", 0)
+    pull = _g(row, "pull_slow", 0)
+    pull_mid = _g(row, "pull_mid", 0)
+
+    hits = []
+    factors = {"trend":0.0, "momentum":0.0, "breakout":0.0, "pullback":0.0, 
+               "volume":0.0, "pattern":0.0, "fundamental":0.0, "sentiment":0.0}
 
     # TREND
-    if c>e9>e21>e50>e200: add(0.96,"Full EMA Bull Stack (All 4 EMAs)","Trend")
-    elif c>e9>e21>e50:    add(0.85,"EMA Bull Stack (9>21>50)","Trend")
-    elif c>e9>e21:        add(0.70,"Short EMA Bullish (9>21)","Trend")
-    if c>e200 and e50>e200: add(0.72,"Price & EMA50 Above 200","Trend")
-    if pe9<=pe21 and e9>e21: add(0.92,"Golden Cross: EMA9/EMA21","Trend")
-    if adx>28 and e9>e21 and pdi>mdi: add(0.88,"Strong Trend: ADX>28, +DI>-DI","Trend")
-    if adx>40: add(0.92,"Very Strong Trend: ADX>40","Trend")
-    if stf==1: add(0.97,"SuperTrend BUY Flip","Trend")
-    elif st==1: add(0.74,"SuperTrend Bullish Mode","Trend")
+    if c > e_fast > e_slow > e_trend:
+        factors["trend"] = 1.0
+        hits.append((0.95, f"Full EMA Stack ({hcfg.ema_fast}>{hcfg.ema_slow}>{hcfg.ema_trend})", "Trend"))
+    elif c > e_fast > e_slow:
+        factors["trend"] = 0.7
+        hits.append((0.80, f"EMA Bullish ({hcfg.ema_fast}>{hcfg.ema_slow})", "Trend"))
+    elif c > e_slow:
+        factors["trend"] = 0.3
+        hits.append((0.50, f"Price above EMA{hcfg.ema_slow}", "Trend"))
+    elif c < e_fast < e_slow < e_trend:
+        factors["trend"] = -1.0
+
+    if adx > 30 and c > e_fast:
+        factors["trend"] = min(1.0, factors["trend"] + 0.2)
+        hits.append((0.75, f"ADX {adx:.0f} — Strong Trend", "Trend"))
+
+    if stf == 1:
+        factors["trend"] = 1.0
+        hits.append((0.98, "SuperTrend BUY Flip", "Trend"))
+    elif st == 1:
+        factors["trend"] = max(factors["trend"], 0.6)
+        hits.append((0.65, "SuperTrend Bullish", "Trend"))
+
     # MOMENTUM
-    if pmh<=0 and mh>0: add(0.90,"MACD Histogram Bull Cross","Momentum")
-    if prsi<30 and rsi>30: add(0.95,"RSI Oversold Bounce","Momentum")
-    elif rsi<30: add(0.87,"RSI Oversold <30","Momentum")
-    elif rsi<38: add(0.73,"RSI Near-Oversold <38","Momentum")
-    if pstk<20 and stk>20 and stk>std_: add(0.90,"Stochastic Bull Cross Oversold","Momentum")
-    elif stk<20: add(0.78,"Stochastic Oversold Zone","Momentum")
-    if pbbp<0.05 and bbp>0.10: add(0.90,"BB Lower Band Bounce","Volatility")
-    elif bbp<0.05: add(0.80,"BB Lower Band Touch","Volatility")
-    # VOLUME
-    if vol>=2.5 and c>pc: add(0.95,"Volume Surge 2.5x (Institutional)","Volume")
-    elif vol>=1.5 and c>pc: add(0.78,"Volume 1.5x Bullish","Volume")
-    if obv>obve and c>e21: add(0.68,"OBV Above 20d EMA","Volume")
-    if obv>pobv>_g(tail.iloc[-3],"obv",0) if len(tail)>=3 else 0: add(0.65,"OBV 3-Bar Rising","Volume")
+    if rsi < 30:
+        factors["momentum"] = 0.9
+        hits.append((0.90, f"RSI {rsi:.1f} — Oversold Bounce", "Momentum"))
+    elif rsi < 40:
+        factors["momentum"] = 0.6
+        hits.append((0.70, f"RSI {rsi:.1f} — Near Oversold", "Momentum"))
+    elif 45 < rsi < 65:
+        factors["momentum"] = 0.4
+        hits.append((0.50, f"RSI {rsi:.1f} — Healthy Momentum", "Momentum"))
+    elif rsi > 75:
+        factors["momentum"] = -0.5
+        hits.append((0.30, f"RSI {rsi:.1f} — Overbought Caution", "Momentum"))
+
+    if mh > 0 and _g(row, "macd_h_p", 0) <= 0:
+        factors["momentum"] = max(factors["momentum"], 0.8)
+        hits.append((0.85, "MACD Histogram Bull Cross", "Momentum"))
+    elif mh > 0:
+        factors["momentum"] = max(factors["momentum"], 0.4)
+        hits.append((0.55, "MACD Positive", "Momentum"))
+
     # BREAKOUT
-    if _g(row,"bo50")==1:
-        sc=0.95 if vol>1.5 else 0.80
-        add(sc,f"50-Day Breakout{' + Volume' if vol>1.5 else ''}","Breakout")
-    if _g(row,"bo20")==1:
-        sc=0.90 if vol>1.5 else 0.74
-        add(sc,f"20-Day Breakout{' + Volume' if vol>1.5 else ''}","Breakout")
-    if _g(row,"n52h")==1 and vol>1.2: add(0.87,"Near 52W High + Volume","Breakout")
-    if _g(row,"cdl_bo_candle")==1: add(0.89,"Breakout Candle (Vol-Confirmed)","Breakout")
-    # PRICE ACTION
-    if _g(row,"cdl_inside")==1 and c>pc and e9>e21: add(0.84,"Inside Bar Breakout","Price Action")
-    if _g(row,"cdl_sup_bounce")==1: add(0.82,"Support Bounce (20D Low Zone)","Price Action")
-    if abs(pull)<2.0 and rsi>45 and e9>e50: add(0.76,"Pullback to EMA21 (Retest)","Price Action")
-    # CANDLESTICK (5 strict)
-    if _g(row,"cdl_bull_eng")==1: add(0.92,"Bullish Engulfing","Candlestick")
-    if _g(row,"cdl_hammer")==1: add(0.84,"Hammer Candle","Candlestick")
-    if _g(row,"cdl_morn_star")==1: add(0.95,"Morning Star (3-Bar Reversal)","Candlestick")
-    return sorted(hits.values(),key=lambda x:-x[0])
+    if bo50 == 1 and vol > 1.5:
+        factors["breakout"] = 0.9
+        hits.append((0.90, "50-Day Breakout + Volume", "Breakout"))
+    elif bo20 == 1 and vol > 1.3:
+        factors["breakout"] = 0.8
+        hits.append((0.80, "20-Day Breakout + Volume", "Breakout"))
+    elif bo20 == 1:
+        factors["breakout"] = 0.5
+        hits.append((0.60, "20-Day Breakout", "Breakout"))
 
-def pat_confidence(hits:List)->float:
-    if not hits: return 0.0
-    s=hits[0][0]
-    for i,h in enumerate(hits[1:6],1): s+=h[0]*(0.60**i)
-    return round(min(s/1.9,0.98),4)
+    if _g(row, "n52h", 0) == 1 and vol > 1.2:
+        factors["breakout"] = max(factors["breakout"], 0.85)
+        hits.append((0.85, "Near 52-Week High + Volume", "Breakout"))
 
-def n_cats(hits:List)->int: return len({h[2] for h in hits})
+    # PULLBACK
+    if abs(pull) < 2.5 and c > e_slow and 40 < rsi < 62:
+        factors["pullback"] = 0.75
+        hits.append((0.75, "Pullback to EMA — Clean Retest", "Pullback"))
+    elif abs(pull_mid) < 3.0 and c > e_trend and 40 < rsi < 65:
+        factors["pullback"] = 0.55
+        hits.append((0.60, "Pullback to Slow EMA", "Pullback"))
+
+    # VOLUME
+    if vol >= 2.5 and ret5 > 0:
+        factors["volume"] = 0.95
+        hits.append((0.95, f"Volume Surge {vol:.1f}x + Up Day", "Volume"))
+    elif vol >= 1.5 and ret5 > 0:
+        factors["volume"] = 0.7
+        hits.append((0.75, f"Volume {vol:.1f}x — Institutional", "Volume"))
+    elif vol >= 1.2 and ret5 > 0:
+        factors["volume"] = 0.4
+        hits.append((0.55, f"Volume {vol:.1f}x — Above Average", "Volume"))
+
+    # PATTERN
+    eng = _g(row, "cdl_bull_eng", 0)
+    ham = _g(row, "cdl_hammer", 0)
+    morn = _g(row, "cdl_morn_star", 0)
+    inside = _g(row, "cdl_inside", 0)
+    sup_bounce = _g(row, "cdl_sup_bounce", 0)
+    bo_candle = _g(row, "cdl_bo_candle", 0)
+
+    if morn == 1:
+        factors["pattern"] = 1.0
+        hits.append((0.95, "Morning Star (3-Bar Reversal)", "Pattern"))
+    elif eng == 1 and vol > 1.2:
+        factors["pattern"] = 0.9
+        hits.append((0.90, "Bullish Engulfing + Volume", "Pattern"))
+    elif eng == 1:
+        factors["pattern"] = 0.7
+        hits.append((0.80, "Bullish Engulfing", "Pattern"))
+    elif ham == 1:
+        factors["pattern"] = 0.75
+        hits.append((0.75, "Hammer Candle", "Pattern"))
+    elif inside == 1 and c > _g(row, "close", c):
+        factors["pattern"] = 0.6
+        hits.append((0.70, "Inside Bar Breakout", "Pattern"))
+    elif sup_bounce == 1:
+        factors["pattern"] = 0.65
+        hits.append((0.65, "Support Bounce (20D Low)", "Pattern"))
+    elif bo_candle == 1:
+        factors["pattern"] = 0.7
+        hits.append((0.70, "Breakout Candle (Vol-Confirmed)", "Pattern"))
+
+    # FUNDAMENTAL (for long term only)
+    if fund and hcfg.name == "long":
+        pe = fund.get("pe")
+        roe = fund.get("roe")
+        eps_g = fund.get("eps_g")
+        if pe and 0 < pe < 25:
+            factors["fundamental"] = 0.5
+            hits.append((0.60, f"P/E {pe:.1f} — Value + Growth", "Fundamental"))
+        elif pe and 0 < pe < 35:
+            factors["fundamental"] = 0.3
+        if roe and roe > 0.20:
+            factors["fundamental"] = max(factors["fundamental"], 0.6)
+            hits.append((0.65, f"ROE {roe*100:.1f}% — Quality", "Fundamental"))
+        elif roe and roe > 0.15:
+            factors["fundamental"] = max(factors["fundamental"], 0.4)
+        if eps_g and eps_g > 0.20:
+            factors["fundamental"] = max(factors["fundamental"], 0.5)
+            hits.append((0.55, f"EPS Growth {eps_g*100:.1f}%", "Fundamental"))
+
+    # SENTIMENT
+    if ret5 > 0.03 and ret20 > 0.05:
+        factors["sentiment"] = 0.6
+        hits.append((0.60, "Strong 5D + 20D Momentum", "Sentiment"))
+    elif ret5 > 0.01 and ret20 > 0.03:
+        factors["sentiment"] = 0.4
+        hits.append((0.50, "Building Momentum", "Sentiment"))
+    elif ret60 < -0.15:
+        factors["sentiment"] = -0.3
+        hits.append((0.30, "Weak 60D Trend — Caution", "Sentiment"))
+
+    # Weighted score
+    w = hcfg.weights
+    total = sum(factors[k] * w.get(k, 0) for k in factors)
+    weight_sum = sum(abs(w.get(k, 0)) for k in w)
+    score = float(np.clip(total / weight_sum if weight_sum else 0, -1, 1))
+
+    hits.sort(key=lambda x: -x[0])
+    return score, hits, factors
+
+def horizon_trade_levels(close: float, atr: float, hcfg: HorizonCfg) -> Optional[dict]:
+    if atr <= 0 or close <= 0: return None
+    def rr(sl, tp): return round(abs(tp-close) / abs(close-sl), 2) if abs(close-sl) > 0 else 0.0
+    sl = round(close - hcfg.atr_sl_mult * atr, 2)
+    tp = round(close + hcfg.atr_tp_mult * atr, 2)
+    rr_val = rr(sl, tp)
+    if rr_val < hcfg.min_rr: return None
+    return dict(
+        entry=round(close, 2), sl=sl, tp=tp,
+        risk=round(abs(close-sl), 2), reward=round(abs(tp-close), 2),
+        rr=rr_val, rr_str=f"1:{rr_val}",
+        window=hcfg.label.split("(")[1].replace(")","") if "(" in hcfg.label else hcfg.label,
+        atr_mult_sl=hcfg.atr_sl_mult, atr_mult_tp=hcfg.atr_tp_mult
+    )
+
+def generate_verdict(row, score: float, hits: List, factors: dict, hcfg: HorizonCfg, 
+                     fund: dict = None, nifty_trend: float = 0) -> dict:
+    """Generate BUY / AVOID / WATCH / WAIT verdict with detailed rationale."""
+    c = _g(row, "close")
+    rsi = _g(row, "rsi14", 50)
+    adx = _g(row, "adx", 20)
+    vol = _g(row, "vol_ratio", 1.0)
+    atr_pct = _g(row, "atr_pct", 2.0)
+    e9 = _g(row, "ema9"); e21 = _g(row, "ema21"); e50 = _g(row, "ema50")
+    ret5 = _g(row, "ret5", 0); ret20 = _g(row, "ret20", 0)
+
+    why_buy = []
+    why_avoid = []
+    why_wait = []
+
+    # WHY BUY
+    if score >= hcfg.threshold:
+        why_buy.append(f"✅ Score {score:+.3f} exceeds threshold {hcfg.threshold}")
+    if factors.get("trend", 0) > 0.5:
+        why_buy.append("✅ Strong trend alignment — EMAs stacked bullishly")
+    if factors.get("momentum", 0) > 0.5:
+        why_buy.append("✅ Momentum building — RSI/MACD turning positive")
+    if factors.get("breakout", 0) > 0.5:
+        why_buy.append("✅ Breakout confirmed — price above key resistance with volume")
+    if factors.get("volume", 0) > 0.5:
+        why_buy.append(f"✅ Volume surge {vol:.1f}x — institutional participation")
+    if factors.get("pattern", 0) > 0.5:
+        why_buy.append("✅ Bullish candlestick pattern confirmed")
+    if factors.get("fundamental", 0) > 0.3:
+        why_buy.append("✅ Strong fundamentals — quality + growth at reasonable price")
+    if nifty_trend > 0.3:
+        why_buy.append("✅ Market tailwind — Nifty in bullish regime")
+
+    # WHY AVOID
+    if score < hcfg.threshold - 0.1:
+        why_avoid.append(f"❌ Score {score:+.3f} too weak — below threshold {hcfg.threshold}")
+    if rsi > 75:
+        why_avoid.append(f"❌ RSI {rsi:.1f} overbought — high pullback risk")
+    if adx < 15 and score < 0.1:
+        why_avoid.append("❌ ADX < 15 — no trend, chop likely")
+    if atr_pct > 6.0 and hcfg.name == "short":
+        why_avoid.append(f"❌ ATR {atr_pct:.1f}% too volatile for short-term swing")
+    if ret20 < -0.10 and hcfg.name in ("short", "mid"):
+        why_avoid.append("❌ Down 10%+ in 20 days — counter-trend for short/mid term")
+    if nifty_trend < -0.5:
+        why_avoid.append("❌ Bear market — headwind for long positions")
+    if vol < 0.8 and score > 0:
+        why_avoid.append("❌ Volume below average — low conviction, liquidity risk")
+    if fund and fund.get("de", 0) and fund["de"] > 3.0:
+        why_avoid.append("❌ High debt/equity > 3.0 — balance sheet risk")
+
+    # WHY WAIT
+    if 0.05 < score < hcfg.threshold:
+        why_wait.append(f"⏳ Score {score:+.3f} close to threshold — monitor for confirmation")
+    if 35 < rsi < 45:
+        why_wait.append(f"⏳ RSI {rsi:.1f} neutral — wait for momentum confirmation")
+    if e9 > e21 and c < e9:
+        why_wait.append("⏳ Price below fast EMA — wait for reclaim")
+    if vol < 1.0 and factors.get("breakout", 0) > 0.3:
+        why_wait.append("⏳ Breakout lacks volume confirmation — wait for volume spike")
+    if ret5 > 0.05 and hcfg.name == "short":
+        why_wait.append("⏳ Already up 5% in 5 days — wait for pullback entry")
+    if hcfg.name == "long" and (not fund or not fund.get("pe")):
+        why_wait.append("⏳ Fundamental data incomplete — verify before investing")
+    if nifty_trend > -0.3 and nifty_trend < 0.2:
+        why_wait.append("⏳ Market sideways — better entries may come")
+
+    # Determine verdict
+    if score >= hcfg.threshold and len(why_buy) >= 2 and len(why_avoid) < 2:
+        verdict = "BUY"
+        confidence = min(95, int(50 + score * 100 + len(why_buy) * 5))
+    elif len(why_avoid) >= 3 or score < hcfg.threshold - 0.15:
+        verdict = "AVOID"
+        confidence = min(95, int(50 + (1 - abs(score)) * 50 + len(why_avoid) * 5))
+    elif len(why_wait) >= 2 and score > 0:
+        verdict = "WAIT"
+        confidence = min(80, int(40 + score * 80))
+    else:
+        verdict = "WATCH"
+        confidence = min(70, int(30 + abs(score) * 70))
+
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "score": round(score, 4),
+        "threshold": hcfg.threshold,
+        "why_buy": why_buy,
+        "why_avoid": why_avoid,
+        "why_wait": why_wait,
+        "factors": {k: round(v, 3) for k, v in factors.items()},
+        "primary_signals": [h[1] for h in hits[:3]],
+        "all_hits": hits,
+    }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §6  SCORING  (Price-only for backtest; fundamentals for live display only)
-# ══════════════════════════════════════════════════════════════════════════════
-def row_score(row, weights:dict, use_fundamentals:bool=False)->float:
-    c=_g(row,"close"); e9=_g(row,"ema9"); e21=_g(row,"ema21")
-    e50=_g(row,"ema50"); e200=_g(row,"ema200",e50)
-    bull=((c>e9)+(e9>e21)+(e21>e50)+(e50>e200))/4.0
-    bear=((c<e9)+(e9<e21)+(e21<e50)+(e50<e200))/4.0
-    trend=float(np.clip(bull-bear,-1,1))
-    rsi=_g(row,"rsi14",50); mh=_g(row,"macd_h")
-    atr=_g(row,"atr14",c*0.02) or c*0.02
-    rsi_s=float(np.clip((rsi-50)/18,-1,1))
-    macd_s=float(np.clip((mh/atr)*3,-1,1))
-    mom=float(np.clip(0.6*rsi_s+0.4*macd_s,-1,1))
-    bd=_g(row,"bo20"); vol=_g(row,"vol_ratio",1.0)
-    bod=float(np.clip(_g(row,"bo_d",0)/8,-1,1))
-    brk=float(np.clip(max(float(bd),bod)*min(vol/1.5,1.2),-1,1))
-    pull=_g(row,"pull_slow",0)
-    pull_s=(0.75 if (abs(pull)<2.5 and c>e50 and 40<rsi<62) else
-            0.55 if (abs(pull)<2.5 and c>e21 and 40<rsi<62) else 0.0)
-    vol_s=float(np.clip((vol-1)/1.5,-1,1))
-    eng=_g(row,"cdl_bull_eng"); ham=_g(row,"cdl_hammer"); morn=_g(row,"cdl_morn_star")
-    pat_raw=(1.0 if (morn or eng) else 0.85 if ham else 0.0)
-    pat_s=float(np.clip(pat_raw,-1,1))
-    fund_s=0.0
-    if use_fundamentals:
-        pe=_g(row,"_pe",0); roe=_g(row,"_roe",0); eg=_g(row,"_epsg",0)
-        if pe>0: fund_s+=0.35 if pe<22 else (-0.20 if pe>60 else 0.10)
-        if roe>0: fund_s+=0.35 if roe>0.18 else (-0.10 if roe<0.05 else 0.10)
-        if eg!=0: fund_s+=0.20 if eg>0.12 else (-0.10 if eg<0 else 0.05)
-        fund_s=float(np.clip(fund_s,-1,1))
-    r5=_g(row,"ret5",0); sent_s=float(np.clip(r5/0.05,-1,1))
-    w=weights; ws=sum(abs(v) for v in w.values())
-    sc=(w.get("trend",0)*trend+w.get("momentum",0)*mom+w.get("breakout",0)*brk+
-        w.get("pullback",0)*pull_s+w.get("volume",0)*vol_s+w.get("pattern",0)*pat_s+
-        w.get("fundamental",0)*fund_s+w.get("sentiment",0)*sent_s)
-    return float(np.clip(sc/ws,-1,1))
-
-def add_scores(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict, use_fundamentals:bool=False)->pd.DataFrame:
-    df=feat.copy()
-    df["nifty_trend"]=df["date"].map(lambda d: nifty_by_date.get(d,{}).get("trend",0.0))
-    df["threshold"]=np.where(df["nifty_trend"]<=-0.5, cfg.bear_threshold, cfg.base_threshold)
-    df["score"]=df.apply(lambda r: row_score(r,cfg.weights,use_fundamentals=use_fundamentals),axis=1)
-    df["signal"]=np.where(df["score"]>=df["threshold"],"LONG","NEUTRAL")
-    return df
-
-# ══════════════════════════════════════════════════════════════════════════════
-# §7  HEURISTIC CONFIDENCE  (Honest label — not "AI")
-# ══════════════════════════════════════════════════════════════════════════════
-def heuristic_confidence(row,fund:dict,hits:list)->dict:
-    W={"trend":0.24,"momentum":0.16,"breakout":0.17,"pullback":0.11,
-       "volume":0.10,"pattern":0.10,"fundamental":0.08,"sentiment":0.04}
-    c=_g(row,"close"); e9=_g(row,"ema9"); e21=_g(row,"ema21")
-    e50=_g(row,"ema50"); e200=_g(row,"ema200",e50)
-    bull=((c>e9)+(e9>e21)+(e21>e50)+(e50>e200))/4.0
-    bear=((c<e9)+(e9<e21)+(e21<e50)+(e50<e200))/4.0
-    trend_s=float(np.clip(bull-bear,-1,1))
-    rsi=_g(row,"rsi14",50); mh=_g(row,"macd_h")
-    atr=_g(row,"atr14",c*0.02) or c*0.02
-    rsi_s=float(np.clip((rsi-50)/18,-1,1)); macd_s=float(np.clip((mh/atr)*3,-1,1))
-    mom_s=float(np.clip(0.6*rsi_s+0.4*macd_s,-1,1))
-    bd=_g(row,"bo20"); vol=_g(row,"vol_ratio",1.0)
-    brk_s=float(np.clip(bd*(vol/1.5),-1,1))
-    pull=_g(row,"pull_slow",0)
-    pull_s=0.75 if (abs(pull)<2.5 and c>e50 and 40<rsi<62) else 0.0
-    vol_s=float(np.clip((vol-1)/1.5,-1,1))
-    pat_s=min(sum(h[0]*0.15 for h in hits[:6]),1.0)
-    pe=fund.get("pe"); roe=fund.get("roe"); eg=fund.get("eps_g")
-    rg=fund.get("rev_g"); de=fund.get("de"); peg=fund.get("peg")
-    fund_s=0.0
-    if pe and pe>0: fund_s+=0.30 if pe<18 else(0.15 if pe<28 else(-0.20 if pe>55 else 0.05))
-    if roe: fund_s+=0.30 if roe>0.20 else(0.10 if roe>0.12 else(-0.10 if roe<0.05 else 0))
-    if eg: fund_s+=0.20 if eg>0.15 else(-0.10 if eg<0 else 0.05)
-    if rg: fund_s+=0.10 if rg>0.10 else 0
-    if de: fund_s-=0.15 if de>3 else(0.05 if de>1.5 else 0)
-    if peg and peg>0: fund_s+=0.10 if peg<1 else(-0.05 if peg>2 else 0)
-    fund_s=float(np.clip(fund_s,-1,1))
-    r5=_g(row,"ret5",0); r20=_g(row,"ret20",0)
-    sent_s=float(np.clip((r5*0.7+r20*0.3)/0.05,-1,1))
-    total=float(np.clip(
-        W["trend"]*trend_s+W["momentum"]*mom_s+W["breakout"]*brk_s+
-        W["pullback"]*pull_s+W["volume"]*vol_s+W["pattern"]*pat_s+
-        W["fundamental"]*fund_s+W["sentiment"]*sent_s,-1,1))
-    pct=round(((total+1)/2)*100,1)
-    bonus=0.0
-    if trend_s>0.75: bonus+=0.03
-    if vol_s>0.40: bonus+=0.02
-    if pat_s>0.50: bonus+=0.02
-    pct=min(round(pct+bonus*50,1),99.0)
-    return dict(model_pct=pct,total=round(total,4),trend_s=round(trend_s,3),
-                mom_s=round(mom_s,3),brk_s=round(brk_s,3),vol_s=round(vol_s,3),
-                fund_s=round(fund_s,3),sent_s=round(sent_s,3),pat_s=round(pat_s,3))
-
-def mkt_confidence(nifty:dict)->dict:
-    if not nifty: return dict(pct=50.0,label="Unknown",align="N/A",nifty_last=0,chg_1m=0,rsi=50)
-    nt=nifty.get("trend",0.0); lbl=nifty.get("label","N/A")
-    nl=nifty.get("last",0.0); c1m=nifty.get("chg_1m",0.0); nr=nifty.get("rsi",50.0)
-    pct=float(np.clip((nt+1)/2*100,0,100))
-    align=("Favorable" if nt>0.5 else "Supportive" if nt>0.2 else
-           "Headwind" if nt<-0.3 else "Neutral")
-    return dict(pct=round(pct,1),label=lbl,align=align,
-                nifty_last=round(nl,2),chg_1m=round(c1m,2),rsi=round(nr,1))
-
-# ══════════════════════════════════════════════════════════════════════════════
-# §8  TRADE LEVELS  (Unified for display AND backtest)
-# ══════════════════════════════════════════════════════════════════════════════
-def trade_levels(close:float,atr:float,cfg:Cfg)->Optional[dict]:
-    if atr<=0 or close<=0: return None
-    def rr(sl,tp): return round(abs(tp-close)/abs(close-sl),2) if abs(close-sl)>0 else 0.0
-    st_sl=round(close-cfg.st_sl_mult*atr,2); st_tp=round(close+cfg.st_tp_mult*atr,2)
-    lt_sl=round(close-cfg.lt_sl_mult*atr,2); lt_tp=round(close+cfg.lt_tp_mult*atr,2)
-    st_rr=rr(st_sl,st_tp); lt_rr=rr(lt_sl,lt_tp)
-    if st_rr<cfg.min_rr and lt_rr<cfg.min_rr: return None
-    def pkg(sl,tp,rr_v,win):
-        return dict(entry=round(close,2),sl=sl,tp=tp,risk=round(abs(close-sl),2),
-                    reward=round(abs(tp-close),2),rr=rr_v,rr_str=f"1:{rr_v}",window=win)
-    return dict(short_term=pkg(st_sl,st_tp,st_rr,"2–5 trading days"),
-                long_term=pkg(lt_sl,lt_tp,lt_rr,"10–20 trading days"))
-
-# ══════════════════════════════════════════════════════════════════════════════
-# §9  BACKTEST ENGINE  (Production: no lookahead, realistic fills, vol targeting, corr guard)
+# §6  BACKTEST ENGINE  (With strategy attribution tracking)
 # ══════════════════════════════════════════════════════════════════════════════
 @dataclass
 class _Pos:
-    sym:str; qty:int; entry_date:pd.Timestamp; entry_p:float; stop:float; target:float; fees_in:float; bars:int=0
+    sym:str; qty:int; entry_date:pd.Timestamp; entry_p:float; stop:float; target:float
+    fees_in:float; horizon:str; signals:List[str]; bars:int=0
 
-def run_backtest(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict)->dict:
+def run_backtest(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict, horizon:str="mid")->dict:
+    hcfg = getattr(cfg, f"{horizon}_cfg", cfg.mid_cfg)
     empty=dict(ret=0.0,sharpe=0.0,maxdd=0.0,winrate=0.0,trades=0,
-               final=cfg.bt_capital,avg_ret=0.0,avg_bars=0.0,trades_df=pd.DataFrame(),equity_df=pd.DataFrame())
+               final=cfg.bt_capital,avg_ret=0.0,avg_bars=0.0,
+               trades_df=pd.DataFrame(),equity_df=pd.DataFrame(),
+               strategy_attribution=defaultdict(lambda: {"wins":0,"losses":0,"pnl":0.0}))
     need={"date","symbol","open","high","low","close","score","signal","atr14"}
     if not need.issubset(feat.columns):
         LOG.error("Backtest missing columns: %s", need-set(feat.columns))
         return empty
-    data=feat.copy()
-    data["date"]=_norm_dates(data["date"])
+    data=feat.copy(); data["date"]=_norm_dates(data["date"])
     data=data.sort_values(["date","symbol"]).reset_index(drop=True)
     # Survivorship guard
     expected_bars=data["date"].nunique()
     sym_counts=data.groupby("symbol")["date"].nunique()
     valid_syms=set(sym_counts[sym_counts>=expected_bars*0.95].index)
     if len(valid_syms)<len(sym_counts):
-        LOG.info("Survivorship guard: dropped %d symbols with incomplete history", len(sym_counts)-len(valid_syms))
         data=data[data["symbol"].isin(valid_syms)].copy()
     if data.empty: return empty
     by_d={d:g.set_index("symbol") for d,g in data.groupby("date")}
@@ -710,10 +854,12 @@ def run_backtest(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict)->dict:
     returns_df=pivot_close.pct_change().fillna(0)
     cost=cfg.bt_cost_bps/10_000; slip=cfg.bt_slip_bps/10_000
     poss:Dict[str,_Pos]={}; trades=[]; eq_rows=[]; cash=cfg.bt_capital
+    # Strategy attribution tracker
+    strat_attr=defaultdict(lambda:{"wins":0,"losses":0,"pnl":0.0,"trades":0})
+
     for idx,date in enumerate(dates):
-        day=by_d[date]
-        nd=dates[idx+1] if idx+1<len(dates) else None
-        # Execute exits
+        day=by_d[date]; nd=dates[idx+1] if idx+1<len(dates) else None
+        # Exits
         for sym in list(poss.keys()):
             p=poss[sym]
             if sym not in day.index: continue
@@ -722,43 +868,51 @@ def run_backtest(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict)->dict:
             exit_price=None; reason=None
             if lo<=p.stop:
                 exit_price=o if o<=p.stop else p.stop
-                exit_price*=(1-slip)
-                reason="stop_loss"
+                exit_price*=(1-slip); reason="stop_loss"
             elif h>=p.target:
                 exit_price=o if o>=p.target else p.target
-                exit_price*=(1+slip)
-                reason="take_profit"
-            elif p.bars>=cfg.bt_max_hold:
+                exit_price*=(1+slip); reason="take_profit"
+            elif p.bars>=hcfg.max_hold:
                 exit_price=c*(1-slip); reason="max_hold"
-            elif p.bars>=cfg.bt_min_hold and str(row.get("signal","NEUTRAL"))!="LONG":
+            elif p.bars>=hcfg.min_hold and str(row.get("signal","NEUTRAL"))!="LONG":
                 exit_price=o*(1-slip); reason="signal_exit"
             if exit_price is not None and nd is not None:
                 tv=p.qty*exit_price; ef=abs(tv)*cost; cash+=tv-ef
                 pnl=p.qty*(exit_price-p.entry_p)-p.fees_in-ef
                 basis=p.qty*p.entry_p
+                ret=pnl/basis if basis else 0
                 trades.append(dict(sym=sym,entry=p.entry_date,exit=date,ep=round(p.entry_p,2),
-                                   xp=round(exit_price,2),pnl=round(pnl,2),
-                                   ret=round(pnl/basis if basis else 0,4),
-                                   bars=p.bars,reason=reason))
+                                   xp=round(exit_price,2),pnl=round(pnl,2),ret=round(ret,4),
+                                   bars=p.bars,reason=reason,horizon=horizon,signals=p.signals))
+                # Attribution
+                for sig in p.signals:
+                    strat_attr[sig]["trades"]+=1
+                    strat_attr[sig]["pnl"]+=pnl
+                    if pnl>0: strat_attr[sig]["wins"]+=1
+                    else: strat_attr[sig]["losses"]+=1
                 del poss[sym]
-            elif p.bars>=cfg.bt_max_hold and nd is None:
+            elif p.bars>=hcfg.max_hold and nd is None:
                 exit_price=c*(1-slip); tv=p.qty*exit_price; ef=abs(tv)*cost; cash+=tv-ef
                 pnl=p.qty*(exit_price-p.entry_p)-p.fees_in-ef; basis=p.qty*p.entry_p
+                ret=pnl/basis if basis else 0
                 trades.append(dict(sym=sym,entry=p.entry_date,exit=date,ep=round(p.entry_p,2),
-                                   xp=round(exit_price,2),pnl=round(pnl,2),
-                                   ret=round(pnl/basis if basis else 0,4),bars=p.bars,reason="eop"))
+                                   xp=round(exit_price,2),pnl=round(pnl,2),ret=round(ret,4),
+                                   bars=p.bars,reason="eop",horizon=horizon,signals=p.signals))
+                for sig in p.signals:
+                    strat_attr[sig]["trades"]+=1; strat_attr[sig]["pnl"]+=pnl
+                    if pnl>0: strat_attr[sig]["wins"]+=1
+                    else: strat_attr[sig]["losses"]+=1
                 del poss[sym]
         # Equity
         equity=cash+sum(p.qty*float(day.loc[s,"close"]) for s,p in poss.items() if s in day.index)
         eq_rows.append(dict(date=date,equity=round(equity,2)))
         if not nd: continue
-        # New entries
-        blocked=set(poss.keys())
-        slots=cfg.bt_max_pos-len(poss)
+        # Entries
+        blocked=set(poss.keys()); slots=cfg.bt_max_pos-len(poss)
         if slots<=0: continue
         cands=day.reset_index()
         cands=cands[(cands.get("signal","NEUTRAL")=="LONG")&
-                    (cands.get("score",pd.Series(dtype=float)).fillna(0)>=cands.get("threshold",cfg.base_threshold))&
+                    (cands.get("score",pd.Series(dtype=float)).fillna(0)>=cands.get("threshold",hcfg.threshold))&
                     (~cands["symbol"].isin(blocked))].sort_values("score",ascending=False)
         selected=[]
         for _,r in cands.iterrows():
@@ -768,22 +922,18 @@ def run_backtest(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict)->dict:
             if selected:
                 window=returns_df.loc[:date].tail(60)
                 if len(window)>=20:
-                    sym_rets=window.get(sym,pd.Series(dtype=float))
-                    ok=True
+                    sym_rets=window.get(sym,pd.Series(dtype=float)); ok=True
                     for s in selected:
                         s_rets=window.get(s,pd.Series(dtype=float))
                         common=pd.concat([sym_rets,s_rets],axis=1).dropna()
                         if len(common)>=20:
                             corr=np.corrcoef(common.iloc[:,0],common.iloc[:,1])[0,1]
-                            if abs(corr)>cfg.bt_max_correlation:
-                                ok=False; break
+                            if abs(corr)>cfg.bt_max_correlation: ok=False; break
                     if not ok: continue
-            close=float(r["close"])
-            atr=float(r.get("atr14",close*0.02)) or close*0.02
-            lvl=trade_levels(close,atr,cfg)
+            close=float(r["close"]); atr=float(r.get("atr14",close*0.02)) or close*0.02
+            lvl=horizon_trade_levels(close,atr,hcfg)
             if lvl is None: continue
-            stop_p=lvl["short_term"]["sl"]
-            risk_per_share=abs(close-stop_p)
+            stop_p=lvl["sl"]; risk_per_share=abs(close-stop_p)
             if risk_per_share<=0: continue
             risk_amt=equity*cfg.bt_risk_per_trade
             qty=int(risk_amt//risk_per_share)
@@ -792,414 +942,235 @@ def run_backtest(feat:pd.DataFrame, cfg:Cfg, nifty_by_date:Dict)->dict:
             if qty<=0: continue
             total_cost=qty*close
             if cash<total_cost*(1+cost*2): continue
-            fees_in=total_cost*cost
-            cash-=total_cost+fees_in
-            poss[sym]=_Pos(sym,qty,date,close,stop_p,lvl["short_term"]["tp"],fees_in)
+            fees_in=total_cost*cost; cash-=total_cost+fees_in
+            # Extract signals from row for attribution
+            sigs=[]
+            for col in ["cdl_bull_eng","cdl_hammer","cdl_morn_star","cdl_inside","cdl_sup_bounce","cdl_bo_candle"]:
+                if r.get(col,0)==1: sigs.append(col)
+            if r.get("st_flip",0)==1: sigs.append("supertrend_flip")
+            if r.get("bo20",0)==1: sigs.append("breakout_20d")
+            if r.get("bo50",0)==1: sigs.append("breakout_50d")
+            poss[sym]=_Pos(sym,qty,date,close,stop_p,lvl["tp"],fees_in,horizon,sigs)
             selected.append(sym)
         for p in poss.values(): p.bars+=1
     # Final liquidation
     ld=by_d[dates[-1]]
     for sym,p in list(poss.items()):
         if sym not in ld.index: continue
-        fp=float(ld.loc[sym,"close"])*(1-slip)
-        tv=p.qty*fp; ef=abs(tv)*cost; cash+=tv-ef
+        fp=float(ld.loc[sym,"close"])*(1-slip); tv=p.qty*fp; ef=abs(tv)*cost; cash+=tv-ef
         pnl=p.qty*(fp-p.entry_p)-p.fees_in-ef; basis=p.qty*p.entry_p
+        ret=pnl/basis if basis else 0
         trades.append(dict(sym=sym,entry=p.entry_date,exit=dates[-1],ep=round(p.entry_p,2),
-                           xp=round(fp,2),pnl=round(pnl,2),
-                           ret=round(pnl/basis if basis else 0,4),bars=p.bars,reason="eop"))
+                           xp=round(fp,2),pnl=round(pnl,2),ret=round(ret,4),
+                           bars=p.bars,reason="eop",horizon=horizon,signals=p.signals))
+        for sig in p.signals:
+            strat_attr[sig]["trades"]+=1; strat_attr[sig]["pnl"]+=pnl
+            if pnl>0: strat_attr[sig]["wins"]+=1
+            else: strat_attr[sig]["losses"]+=1
     eq=pd.DataFrame(eq_rows); trd=pd.DataFrame(trades)
     if eq.empty or len(eq)<2: return empty
-    eq["dr"]=eq["equity"].pct_change().fillna(0)
-    eq["dd"]=(eq["equity"]/eq["equity"].cummax())-1
+    eq["dr"]=eq["equity"].pct_change().fillna(0); eq["dd"]=(eq["equity"]/eq["equity"].cummax())-1
     std=float(eq["dr"].std(ddof=0)) if len(eq)>1 else 0
     sharpe=float((eq["dr"].mean()/std)*sqrt(252)) if std else 0.0
     final=float(eq["equity"].iloc[-1])
+    # Process attribution
+    attr_summary={}
+    for sig,vals in strat_attr.items():
+        if vals["trades"]>0:
+            attr_summary[sig]={
+                "trades":vals["trades"],"wins":vals["wins"],"losses":vals["losses"],
+                "winrate":round(vals["wins"]/vals["trades"],3),
+                "total_pnl":round(vals["pnl"],2),
+                "avg_pnl":round(vals["pnl"]/vals["trades"],2),
+                "status":"HOT" if vals["wins"]>vals["losses"] and vals["pnl"]>0 else "COLD" if vals["losses"]>vals["wins"] else "NEUTRAL"
+            }
     return dict(ret=round(final/cfg.bt_capital-1,4),sharpe=round(sharpe,3),
                 maxdd=round(float(eq["dd"].min()),4),
                 winrate=round(float((trd["pnl"]>0).mean()) if not trd.empty else 0,3),
                 trades=len(trd),final=round(final,2),
                 avg_ret=round(float(trd["ret"].mean()) if not trd.empty else 0,4),
                 avg_bars=round(float(trd["bars"].mean()) if not trd.empty else 0,1),
-                trades_df=trd,equity_df=eq)
+                trades_df=trd,equity_df=eq,strategy_attribution=attr_summary)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §10  ALERT BUILDER  (Swing trades — 2-20 day holds)
+# §7  THREE-HORIZON ALERT BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
-def _sel_reason(row,hits,fund,conf,mkt)->str:
-    parts=[]; e9=_g(row,"ema9"); e21=_g(row,"ema21"); e50=_g(row,"ema50")
-    rsi=_g(row,"rsi14",50); vol=_g(row,"vol_ratio",1.0); mh=_g(row,"macd_h")
-    c=_g(row,"close"); adx=_g(row,"adx",0); stf=int(_g(row,"st_flip",0))
-    if hits: parts.append(f"Primary: {hits[0][1]} ({hits[0][0]*100:.0f}% conf)")
-    if stf==1: parts.append("SuperTrend just flipped BULLISH")
-    if e9>e21>e50: parts.append(f"Full EMA alignment ({e9:.0f}>{e21:.0f}>{e50:.0f})")
-    elif e9>e21: parts.append(f"EMA bullish ({e9:.0f}>{e21:.0f})")
-    if rsi<35: parts.append(f"RSI={rsi:.1f} oversold")
-    elif 45<rsi<65: parts.append(f"RSI={rsi:.1f} healthy")
-    if mh>0: parts.append("MACD histogram positive")
-    if adx>25: parts.append(f"ADX={adx:.0f} strong trend")
-    if vol>=1.5: parts.append(f"Volume {vol:.1f}x avg")
-    pe=fund.get("pe"); roe=fund.get("roe")
-    if pe and pe>0: parts.append(f"P/E={pe:.1f}")
-    if roe and roe>0: parts.append(f"ROE={roe*100:.1f}%")
-    parts.append(f"Market: {mkt.get('label','N/A')} | {mkt.get('align','N/A')}")
-    return "  •  ".join(parts[:7])
-
-def build_alerts(feat:pd.DataFrame, nifty:dict, fund_cache:dict, cfg:Cfg)->tuple:
+def build_three_horizon_alerts(feat:pd.DataFrame, nifty:dict, fund_cache:dict, cfg:Cfg)->Dict[str,List]:
     latest=(feat.sort_values("date").groupby("symbol",sort=False).tail(1).reset_index(drop=True))
-    results=[]; rej=defaultdict(int)
+    results={"short":[],"mid":[],"long":[]}
+    rej=defaultdict(lambda:defaultdict(int))
+    nifty_trend=nifty.get("trend",0.0)
+
     for _,row in latest.iterrows():
         sym=str(row["symbol"]); c=float(row["close"])
-        sig=str(row.get("signal","NEUTRAL")); score=float(row.get("score",0))
-        atr=float(row.get("atr14",c*0.02) or c*0.02); atr_p=atr/c*100 if c else 0
+        atr=float(row.get("atr14",c*0.02)) or c*0.02; atr_p=atr/c*100 if c else 0
         avg_v=float(row.get("avg_vol20",0) or 0); tv=float(row.get("med_tv20",0) or 0)/1e7
-        if sig!="LONG": continue
-        if c<cfg.min_price: rej["price"]+=1; continue
-        if atr_p<cfg.min_atr_pct*100: rej["atr_lo"]+=1; continue
-        if atr_p>cfg.max_atr_pct*100: rej["atr_hi"]+=1; continue
-        if avg_v<cfg.min_avg_vol: rej["vol"]+=1; continue
-        if tv<cfg.min_traded_val_cr: rej["tv"]+=1; continue
-        tail=latest[latest["symbol"]==sym].tail(3)
-        hits=detect_patterns(row,tail); pc=pat_confidence(hits); cats=n_cats(hits)
-        if cats<cfg.min_categories: rej["cats"]+=1; continue
-        lvl=trade_levels(c,atr,cfg)
-        if lvl is None: rej["rr"]+=1; continue
+
+        # Universal filters
+        if c<cfg.min_price: continue
+        if avg_v<cfg.min_avg_vol: continue
+        if tv<cfg.min_traded_val_cr: continue
+
         fund=fund_cache.get(sym,{})
-        conf=heuristic_confidence(row,fund,hits); mk=mkt_confidence(nifty)
-        sel=_sel_reason(row,hits,fund,conf,mk)
-        results.append(dict(
-            symbol=sym,last_close=round(c,2),score=round(score,4),
-            atr=round(atr,2),atr_pct=round(atr_p,2),
-            rsi=round(float(row.get("rsi14",50) or 50),1),
-            macd_h=round(float(row.get("macd_h",0) or 0),4),
-            adx=round(float(row.get("adx",0) or 0),1),
-            vol_ratio=round(float(row.get("vol_ratio",1) or 1),2),
-            vol_z=round(float(row.get("vol_z",0) or 0),2),
-            avg_vol=int(avg_v),traded_val_cr=round(tv,2),
-            ema9=round(float(row.get("ema9",0) or 0),2),
-            ema21=round(float(row.get("ema21",0) or 0),2),
-            ema50=round(float(row.get("ema50",0) or 0),2),
-            ema200=round(float(row.get("ema200",0) or 0),2),
-            st_flip=int(_g(row,"st_flip",0)),
-            is_fo=sym in _FO_SET,indices=symbol_tags(sym),
-            sector=fund.get("sector","N/A"),industry=fund.get("industry","N/A"),
-            pe=fund.get("pe"),pb=fund.get("pb"),roe=fund.get("roe"),
-            mcap=fund.get("mcap"),w52h=fund.get("w52h"),w52l=fund.get("w52l"),
-            beta=fund.get("beta"),
-            hits=hits,pat_conf=pc,n_cats=cats,levels=lvl,
-            model=conf,mkt=mk,
-            reason=sel,scan_ts=datetime.now().strftime("%Y-%m-%d %H:%M")))
-    results.sort(key=lambda r:(-r["model"]["model_pct"],-abs(r["score"])))
-    LOG.info("Swing Alerts: %d passed | rej: %s",len(results),dict(rej))
+
+        for hname in ["short","mid","long"]:
+            hcfg=getattr(cfg, f"{hname}_cfg")
+            score,hits,factors=score_horizon(row,hcfg,fund)
+
+            # ATR filter per horizon
+            if hname=="short" and atr_p>5.0: rej[hname]["atr_high"]+=1; continue
+            if hname=="mid" and atr_p>4.0: rej[hname]["atr_high"]+=1; continue
+            if hname=="long" and atr_p<1.0: rej[hname]["atr_low"]+=1; continue
+
+            if score<hcfg.threshold: rej[hname]["score"]+=1; continue
+
+            lvl=horizon_trade_levels(c,atr,hcfg)
+            if lvl is None: rej[hname]["rr"]+=1; continue
+
+            verdict=generate_verdict(row,score,hits,factors,hcfg,fund,nifty_trend)
+            if verdict["verdict"] in ("AVOID",): rej[hname]["verdict_avoid"]+=1; continue
+
+            # Require at least 2 positive signals for BUY
+            if verdict["verdict"]=="BUY" and len(verdict["why_buy"])<2:
+                verdict["verdict"]="WATCH"
+                verdict["why_wait"].append("⏳ Need 2+ confirmation signals for BUY")
+
+            results[hname].append(dict(
+                symbol=sym,last_close=round(c,2),score=round(score,4),
+                atr=round(atr,2),atr_pct=round(atr_p,2),
+                rsi=round(float(row.get("rsi14",50) or 50),1),
+                adx=round(float(row.get("adx",0) or 0),1),
+                vol_ratio=round(float(row.get("vol_ratio",1) or 1),2),
+                avg_vol=int(avg_v),traded_val_cr=round(tv,2),
+                ema9=round(float(row.get("ema9",0) or 0),2),
+                ema21=round(float(row.get("ema21",0) or 0),2),
+                ema50=round(float(row.get("ema50",0) or 0),2),
+                ema200=round(float(row.get("ema200",0) or 0),2),
+                st_flip=int(_g(row,"st_flip",0)),
+                is_fo=sym in _FO_SET,indices=symbol_tags(sym),
+                sector=fund.get("sector","N/A"),industry=fund.get("industry","N/A"),
+                pe=fund.get("pe"),pb=fund.get("pb"),roe=fund.get("roe"),
+                mcap=fund.get("mcap"),w52h=fund.get("w52h"),w52l=fund.get("w52l"),
+                beta=fund.get("beta"),peg=fund.get("peg"),
+                levels=lvl,verdict=verdict,horizon=hname,
+                scan_ts=datetime.now().strftime("%Y-%m-%d %H:%M")))
+
+    for hname in results:
+        results[hname].sort(key=lambda r:(-r["verdict"]["confidence"] if r["verdict"]["verdict"]=="BUY" else 0,
+                                          -r["score"]))
+        # Put BUY first, then WATCH, then WAIT, then AVOID
+        buy=[r for r in results[hname] if r["verdict"]["verdict"]=="BUY"]
+        watch=[r for r in results[hname] if r["verdict"]["verdict"]=="WATCH"]
+        wait=[r for r in results[hname] if r["verdict"]["verdict"]=="WAIT"]
+        avoid=[r for r in results[hname] if r["verdict"]["verdict"]=="AVOID"]
+        results[hname]=buy+watch+wait+avoid
+        LOG.info("%s horizon: %d BUY, %d WATCH, %d WAIT, %d AVOID | rej: %s",
+                 hname.upper(),len(buy),len(watch),len(wait),len(avoid),dict(rej[hname]))
+
     return results,dict(rej)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §11  MULTIBAGGER ENGINE  (3-10 year, fundamental deep scan)
+# §8  SAVE OUTPUTS
 # ══════════════════════════════════════════════════════════════════════════════
-
-def multibagger_score(info:dict, hist:pd.DataFrame)->dict:
-    """
-    Score a stock for 10x-100x multibagger potential over 3-10 years.
-    Returns: score (0-100), details list, category, projections.
-    """
-    score = 0
-    details = []
-    warnings_list = []
-
-    # Extract fundamentals
-    pe = info.get("trailingPE")
-    fpe = info.get("forwardPE")
-    rev_g = info.get("revenueGrowth", 0) or 0
-    eps_g = info.get("earningsGrowth", 0) or 0
-    roe = info.get("returnOnEquity", 0) or 0
-    de = info.get("debtToEquity", 999)
-    pm = info.get("profitMargins", 0) or 0
-    mcap = info.get("marketCap", 0) or 0
-    mcap_cr = mcap / 1e7 if mcap else 0
-    peg = info.get("pegRatio")
-    sector = info.get("sector", "N/A")
-    industry = info.get("industry", "N/A")
-    w52h = info.get("fiftyTwoWeekHigh")
-    w52l = info.get("fiftyTwoWeekLow")
-
-    # 1. GROWTH POTENTIAL (30 pts)
-    if rev_g > 0.50: score += 20; details.append(f"Revenue growth {rev_g*100:.0f}% — exceptional")
-    elif rev_g > 0.30: score += 15; details.append(f"Revenue growth {rev_g*100:.0f}% — strong")
-    elif rev_g > 0.20: score += 10; details.append(f"Revenue growth {rev_g*100:.0f}% — solid")
-    elif rev_g > 0.10: score += 5; details.append(f"Revenue growth {rev_g*100:.0f}% — moderate")
-    elif rev_g < 0: score -= 5; warnings_list.append("Revenue declining")
-
-    if eps_g > 0.50: score += 10; details.append(f"EPS growth {eps_g*100:.0f}% — explosive")
-    elif eps_g > 0.25: score += 7; details.append(f"EPS growth {eps_g*100:.0f}% — strong")
-    elif eps_g > 0.15: score += 4; details.append(f"EPS growth {eps_g*100:.0f}% — good")
-    elif eps_g < 0: score -= 3; warnings_list.append("EPS declining")
-
-    if fpe and pe and fpe < pe and pe > 0:
-        score += 5; details.append("Forward PE < Trailing PE (earnings acceleration)")
-
-    # 2. QUALITY (25 pts)
-    if roe > 0.25: score += 10; details.append(f"ROE {roe*100:.0f}% — world-class")
-    elif roe > 0.20: score += 8; details.append(f"ROE {roe*100:.0f}% — excellent")
-    elif roe > 0.15: score += 6; details.append(f"ROE {roe*100:.0f}% — very good")
-    elif roe > 0.12: score += 3; details.append(f"ROE {roe*100:.0f}% — decent")
-    elif roe < 0.08: score -= 3; warnings_list.append("ROE below 8%")
-
-    if de < 0.3: score += 10; details.append("Debt/Equity < 0.3 — almost debt-free")
-    elif de < 0.5: score += 7; details.append("Debt/Equity < 0.5 — low debt")
-    elif de < 1.0: score += 4; details.append("Debt/Equity < 1.0 — manageable")
-    elif de > 3.0: score -= 5; warnings_list.append("High debt burden")
-
-    if pm > 0.20: score += 5; details.append(f"Profit margin {pm*100:.0f}% — exceptional")
-    elif pm > 0.15: score += 3; details.append(f"Profit margin {pm*100:.0f}% — healthy")
-    elif pm < 0: score -= 3; warnings_list.append("Negative profit margin")
-
-    # 3. SIZE / RUNWAY (20 pts) — smaller = more 100x potential
-    if 500 < mcap_cr < 3000: score += 20; details.append(f"Small cap ₹{mcap_cr:,.0f} Cr — huge runway")
-    elif 3000 < mcap_cr < 10000: score += 15; details.append(f"Mid-small cap ₹{mcap_cr:,.0f} Cr — large runway")
-    elif 10000 < mcap_cr < 25000: score += 10; details.append(f"Mid cap ₹{mcap_cr:,.0f} Cr — good runway")
-    elif 25000 < mcap_cr < 50000: score += 5; details.append(f"Large mid cap ₹{mcap_cr:,.0f} Cr — limited runway")
-    elif mcap_cr > 50000: score += 2; warnings_list.append("Large cap — 100x mathematically unlikely")
-    else: score += 10; details.append(f"Micro cap ₹{mcap_cr:,.0f} Cr — high risk/reward")
-
-    # 4. TECHNICAL SETUP (15 pts)
-    if not hist.empty and len(hist) > 20:
-        close = float(hist["Close"].iloc[-1]) if "Close" in hist.columns else float(hist["close"].iloc[-1])
-        # 1-year position
-        if len(hist) > 250:
-            ret_1y = close / float(hist["Close"].iloc[-250]) - 1
-            if 0.5 < ret_1y < 2.0: score += 5; details.append(f"1Y return {ret_1y*100:.0f}% — strong momentum + runway")
-            elif 0.2 < ret_1y < 0.5: score += 3; details.append(f"1Y return {ret_1y*100:.0f}% — building momentum")
-            elif ret_1y > 4.0: score -= 5; warnings_list.append("Already up 400%+ — likely late stage")
-            elif ret_1y < -0.3: score += 2; details.append("Deep correction — potential bottoming")
-
-        # Volume surge
-        vol_now = hist["Volume"].iloc[-20:].mean() if "Volume" in hist.columns else hist["volume"].iloc[-20:].mean()
-        vol_old = hist["Volume"].iloc[-60:-20].mean() if len(hist) > 60 else vol_now
-        if vol_old > 0 and vol_now / vol_old > 1.5:
-            score += 5; details.append("Volume surge — institutional accumulation")
-        elif vol_now / vol_old > 1.2:
-            score += 2; details.append("Rising volume — interest building")
-
-        # 52-week position
-        if w52h and w52l and w52h > w52l:
-            pct_from_low = (close - w52l) / (w52h - w52l)
-            if 0.85 < pct_from_low < 0.98:
-                score += 5; details.append("Near 52W high — breakout/consolidation setup")
-            elif 0.70 < pct_from_low < 0.85:
-                score += 3; details.append("Strong uptrend — holding gains")
-            elif pct_from_low < 0.25:
-                score += 2; details.append("Near 52W low — deep value contrarian")
-
-    # 5. VALUATION (10 pts)
-    if peg and peg > 0:
-        if peg < 0.8: score += 10; details.append("PEG < 0.8 — growth is cheap")
-        elif peg < 1.0: score += 8; details.append("PEG < 1.0 — fairly priced growth")
-        elif peg < 1.5: score += 5; details.append("PEG < 1.5 — reasonable")
-        elif peg > 3.0: score -= 5; warnings_list.append("PEG > 3 — expensive for growth")
-
-    if pe and pe > 0:
-        if pe < 20: score += 5; details.append("PE < 20 — value + growth")
-        elif pe < 30: score += 3; details.append("PE < 30 — reasonable")
-        elif pe > 100: score -= 3; warnings_list.append("PE > 100 — priced for perfection")
-
-    # Sector bonus
-    high_growth_sectors = ["Technology", "Healthcare", "Communication Services", "Consumer Cyclical"]
-    if any(s.lower() in str(sector).lower() for s in high_growth_sectors):
-        score += 3; details.append(f"{sector} — high growth sector")
-
-    final_score = max(0, min(score, 100))
-
-    # Category
-    if final_score >= 80: category = "🚀 ROCKET (Top 1% potential)"
-    elif final_score >= 70: category = "💎 GEM (High conviction)"
-    elif final_score >= 60: category = "🔥 HOT (Strong candidate)"
-    elif final_score >= 50: category = "⭐ WATCH (Promising)"
-    else: category = "📋 RESEARCH (Needs work)"
-
-    # Projections (theoretical, not predictions)
-    if mcap_cr > 0 and close > 0:
-        # 2x = double market cap
-        mcap_2x = mcap_cr * 2
-        # 5x
-        mcap_5x = mcap_cr * 5
-        # 10x
-        mcap_10x = mcap_cr * 10
-        # 50x
-        mcap_50x = mcap_cr * 50
-        # 100x
-        mcap_100x = mcap_cr * 100
-    else:
-        mcap_2x = mcap_5x = mcap_10x = mcap_50x = mcap_100x = 0
-
-    return {
-        "score": final_score,
-        "details": details,
-        "warnings": warnings_list,
-        "category": category,
-        "mcap_cr": mcap_cr,
-        "sector": sector,
-        "industry": industry,
-        "projections": {
-            "2x_mcap": round(mcap_2x, 0),
-            "5x_mcap": round(mcap_5x, 0),
-            "10x_mcap": round(mcap_10x, 0),
-            "50x_mcap": round(mcap_50x, 0),
-            "100x_mcap": round(mcap_100x, 0),
-        },
-        "fundamentals": {
-            "pe": pe, "forward_pe": fpe, "peg": peg,
-            "roe": round(roe*100,1) if roe else None,
-            "rev_growth": round(rev_g*100,1) if rev_g else None,
-            "eps_growth": round(eps_g*100,1) if eps_g else None,
-            "debt_equity": round(de,2) if de != 999 else None,
-            "profit_margin": round(pm*100,1) if pm else None,
-            "market_cap_cr": round(mcap_cr,1) if mcap_cr else None,
-        }
-    }
-
-def run_multibagger_scan(cfg:Cfg, symbols:List[str]=None)->List[dict]:
-    """Scan universe for multibagger candidates."""
-    syms = symbols if symbols else _ALL_SYMS
-    syms = sorted(set(syms) - _SKIP_SYMBOLS)
-    results = []
-
-    LOG.info("Multibagger scan: %d symbols", len(syms))
-    for sym in syms:
-        try:
-            # Fetch 1 year history for technical context
-            hist = _safe_dl(yf_ticker(sym), "1y", "1d")
-            if hist.empty or len(hist) < 50:
-                continue
-            # Normalize columns
-            hist.columns = [str(c).lower().strip() for c in hist.columns]
-            if "close" not in hist.columns:
-                continue
-
-            # Fetch fundamentals
-            info = fetch_fundamentals(sym)
-            if not info:
-                continue
-
-            # Score
-            score_data = multibagger_score(info, hist)
-            if score_data["score"] < cfg.mb_min_score:
-                continue
-
-            # Get current price
-            close = float(hist["close"].iloc[-1]) if "close" in hist.columns else float(hist["close"].iloc[-1])
-
-            results.append({
-                "symbol": sym,
-                "score": score_data["score"],
-                "category": score_data["category"],
-                "details": score_data["details"],
-                "warnings": score_data["warnings"],
-                "projections": score_data["projections"],
-                "fundamentals": score_data["fundamentals"],
-                "current_price": round(close, 2),
-                "mcap_cr": score_data["mcap_cr"],
-                "sector": score_data["sector"],
-                "industry": score_data["industry"],
-                "indices": symbol_tags(sym),
-                "is_fo": sym in _FO_SET,
-            })
-        except Exception as e:
-            LOG.debug("Multibagger scan %s: %s", sym, e)
-            continue
-
-    results.sort(key=lambda x: -x["score"])
-    LOG.info("Multibagger scan complete: %d candidates", len(results))
-    return results[:cfg.mb_top_n]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# §12  SAVE OUTPUTS
-# ══════════════════════════════════════════════════════════════════════════════
-def save_all(alerts:list, bt:dict, nifty:dict, cfg:Cfg, mb_results:list=None)->dict:
+def save_all(results:dict, bt:dict, nifty:dict, cfg:Cfg)->dict:
     od=cfg.output_dir; od.mkdir(parents=True, exist_ok=True)
     ts=datetime.now().strftime("%Y%m%d_%H%M")
-    rows=[]
-    for r in alerts:
-        st=r["levels"]["short_term"]; lt=r["levels"]["long_term"]; conf=r["model"]; mk=r["mkt"]
-        rows.append({"scan_ts":r["scan_ts"],"symbol":r["symbol"],"last_close":r["last_close"],
-                     "score":r["score"],"rsi":r["rsi"],"adx":r["adx"],"atr_pct":r["atr_pct"],
-                     "vol_ratio":r["vol_ratio"],"avg_vol":r["avg_vol"],"traded_val_cr":r["traded_val_cr"],
-                     "model_pct":conf["model_pct"],"mkt_pct":mk["pct"],
-                     "pat_conf_pct":round(r["pat_conf"]*100,1),"n_cats":r["n_cats"],
-                     "top_signal":r["hits"][0][1] if r["hits"] else "",
-                     "st_entry":st["entry"],"st_target":st["tp"],"st_sl":st["sl"],"st_rr":st["rr"],
-                     "lt_entry":lt["entry"],"lt_target":lt["tp"],"lt_sl":lt["sl"],"lt_rr":lt["rr"],
-                     "is_fo":r["is_fo"],"indices":r["indices"],"sector":r["sector"],
-                     "pe":r["pe"],"roe":r["roe"],"mcap":r["mcap"],"reason":r["reason"][:250]})
-    pd.DataFrame(rows).to_csv(od/f"swing_alerts_{ts}.csv",index=False)
-    bt.get("trades_df",pd.DataFrame()).to_csv(od/f"swing_trades_{ts}.csv",index=False)
-    bt.get("equity_df",pd.DataFrame()).to_csv(od/f"swing_equity_{ts}.csv",index=False)
-    if mb_results:
-        mb_rows=[]
-        for m in mb_results:
-            f=m["fundamentals"]
-            mb_rows.append({"symbol":m["symbol"],"score":m["score"],"category":m["category"],
-                            "current_price":m["current_price"],"mcap_cr":m["mcap_cr"],
-                            "sector":m["sector"],"industry":m["industry"],"indices":m["indices"],
-                            "pe":f.get("pe"),"forward_pe":f.get("forward_pe"),"peg":f.get("peg"),
-                            "roe":f.get("roe"),"rev_growth":f.get("rev_growth"),
-                            "eps_growth":f.get("eps_growth"),"debt_equity":f.get("debt_equity"),
-                            "profit_margin":f.get("profit_margin"),
-                            "projections":json.dumps(m["projections"]),
-                            "details":" | ".join(m["details"][:5]),
-                            "warnings":" | ".join(m["warnings"][:3])})
-        pd.DataFrame(mb_rows).to_csv(od/f"multibagger_{ts}.csv",index=False)
+
+    for hname in ["short","mid","long"]:
+        alerts=results.get(hname,[])
+        if not alerts: continue
+        rows=[]
+        for r in alerts:
+            v=r["verdict"]; l=r["levels"]
+            rows.append({
+                "scan_ts":r["scan_ts"],"symbol":r["symbol"],"horizon":hname,
+                "verdict":v["verdict"],"confidence":v["confidence"],"score":r["score"],
+                "price":r["last_close"],"rsi":r["rsi"],"adx":r["adx"],"atr_pct":r["atr_pct"],
+                "vol_ratio":r["vol_ratio"],"entry":l["entry"],"target":l["tp"],"stop":l["sl"],
+                "rr":l["rr_str"],"window":l["window"],
+                "why_buy":" | ".join(v["why_buy"][:5]),
+                "why_avoid":" | ".join(v["why_avoid"][:3]),
+                "why_wait":" | ".join(v["why_wait"][:3]),
+                "primary_signals":" | ".join(v["primary_signals"]),
+                "sector":r["sector"],"indices":r["indices"],"is_fo":r["is_fo"],
+            })
+        pd.DataFrame(rows).to_csv(od/f"{hname}_alerts_{ts}.csv",index=False)
+
+    bt.get("trades_df",pd.DataFrame()).to_csv(od/f"trades_{ts}.csv",index=False)
+    bt.get("equity_df",pd.DataFrame()).to_csv(od/f"equity_{ts}.csv",index=False)
+
     with open(od/f"summary_{ts}.json","w") as f:
-        json.dump({"run_ts":ts,"nifty":{k:v for k,v in nifty.items() if k!="ts"},
-                   "backtest":{k:v for k,v in bt.items() if k not in ("trades_df","equity_df")},
-                   "top10_swing":[{"symbol":r["symbol"],"model_pct":r["model"]["model_pct"],
-                                   "st":r["levels"]["short_term"],"lt":r["levels"]["long_term"]}
-                                  for r in alerts[:10]],
-                   "multibagger":[{"symbol":m["symbol"],"score":m["score"],"category":m["category"]}
-                                  for m in (mb_results or [])[:10]]},f,indent=2,default=str)
-    return dict(swing=od/f"swing_alerts_{ts}.csv",multibagger=od/f"multibagger_{ts}.csv" if mb_results else None,output_dir=od)
+        json.dump({
+            "run_ts":ts,"nifty":{k:v for k,v in nifty.items() if k!="ts"},
+            "backtest":{k:v for k,v in bt.items() if k not in ("trades_df","equity_df","strategy_attribution")},
+            "strategy_attribution":bt.get("strategy_attribution",{}),
+            "top_signals":{h:[{"symbol":r["symbol"],"verdict":r["verdict"]["verdict"],
+                              "confidence":r["verdict"]["confidence"],"score":r["score"],
+                              "entry":r["levels"]["entry"],"target":r["levels"]["tp"],
+                              "stop":r["levels"]["sl"],"rr":r["levels"]["rr_str"]}
+                             for r in results.get(h,[])[:10]] for h in ["short","mid","long"]}
+        },f,indent=2,default=str)
+    return dict(output_dir=od)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §13  TERMINAL DISPLAY
+# §9  TERMINAL DISPLAY
 # ══════════════════════════════════════════════════════════════════════════════
-def plain_report(alerts:list, nifty:dict, bt:dict, cfg:Cfg, mb_results:list=None)->None:
-    SEP="="*110
+def plain_report(results:dict, nifty:dict, bt:dict, cfg:Cfg)->None:
+    SEP="="*120
     print(f"\n{SEP}")
-    print(f"NSE SWING TRADER v12.0 (PRODUCTION) | {datetime.now().strftime('%d %b %Y %H:%M')}")
-    print(f"SWING TRADES (2-20 days) | Market: {nifty.get('label','N/A')} | Nifty ₹{nifty.get('last',0):,.2f}")
+    print(f"NSE THREE-HORIZON TRADER v13.0 | {datetime.now().strftime('%d %b %Y %H:%M')}")
+    print(f"Market: {nifty.get('label','N/A')} | Nifty ₹{nifty.get('last',0):,.2f}")
     print(f"Backtest — Return: {bt.get('ret',0):+.2%} | Sharpe: {bt.get('sharpe',0):.3f} | MaxDD: {bt.get('maxdd',0):.2%}")
-    print(f"NOTE: Backtest uses ONLY lagged price data. No fundamentals. Realistic fills. 1% risk sizing.")
+    print(f"NOTE: Three separate engines. No lookahead. Realistic fills. 1% risk per trade.")
     print(SEP)
-    for i,r in enumerate(alerts[:cfg.top_n],1):
-        st=r["levels"]["short_term"]; lt=r["levels"]["long_term"]
-        hits=r["hits"]; conf=r["model"]; mk=r["mkt"]
-        print(f"\n[{i:>2}] *** {r['symbol']} *** Close: ₹{r['last_close']:,.2f} | Model: {conf['model_pct']:.1f}% | Market: {mk['pct']:.1f}%")
-        print(f"     Signal: {hits[0][1] if hits else '—'}")
-        print(f"     ST: Entry ₹{st['entry']:,.2f} → Target ₹{st['tp']:,.2f} | Stop ₹{st['sl']:,.2f} | R:R {st['rr_str']} | {st['window']}")
-        print(f"     LT: Entry ₹{lt['entry']:,.2f} → Target ₹{lt['tp']:,.2f} | Stop ₹{lt['sl']:,.2f} | R:R {lt['rr_str']} | {lt['window']}")
-        print(f"     {r['reason'][:115]}")
-        print("-"*110)
-    if mb_results:
-        print(f"\n{SEP}")
-        print(f"MULTIBAGGER DISCOVERY (3-10 year horizon, 10x-100x potential)")
-        print(f"⚠️  WARNING: 90% of multibagger bets fail. Require 50%+ drawdown tolerance. 1-2% position size per bet.")
-        print(SEP)
-        for i,m in enumerate(mb_results[:10],1):
-            print(f"\n[{i:>2}] *** {m['symbol']} *** Score: {m['score']}/100 | {m['category']}")
-            print(f"     Price: ₹{m['current_price']:,.2f} | MCap: ₹{m['mcap_cr']:,.0f} Cr | Sector: {m['sector']}")
-            print(f"     Details: {' | '.join(m['details'][:4])}")
-            print(f"     2x→5x→10x→50x→100x projections based on compounding. NOT price targets.")
-            if m['warnings']:
-                print(f"     ⚠️  {', '.join(m['warnings'][:2])}")
-            print("-"*110)
+
+    for hname in ["short","mid","long"]:
+        hcfg=getattr(cfg, f"{hname}_cfg")
+        alerts=results.get(hname,[])
+        print(f"\n{'═'*60}")
+        print(f"  {hcfg.label.upper()}")
+        print(f"  {hcfg.description}")
+        print(f"{'═'*60}")
+
+        for i,r in enumerate(alerts[:cfg.top_n],1):
+            v=r["verdict"]; l=r["levels"]
+            emoji={"BUY":"🟢","WATCH":"🟡","WAIT":"🟠","AVOID":"🔴"}.get(v["verdict"],"⚪")
+            print(f"\n  {emoji} [{i:>2}] {r['symbol']} | {v['verdict']} (Confidence: {v['confidence']}%)")
+            print(f"       Price: ₹{r['last_close']:,.2f} | Score: {r['score']:+.4f} | RSI: {r['rsi']:.1f} | ADX: {r['adx']:.1f} | Vol: {r['vol_ratio']:.2f}x")
+            print(f"       Entry: ₹{l['entry']:,.2f} | Target: ₹{l['tp']:,.2f} | Stop: ₹{l['sl']:,.2f} | R:R {l['rr_str']} | {l['window']}")
+            if v["why_buy"]:
+                print(f"       ✅ BUY: {' | '.join(v['why_buy'][:3])}")
+            if v["why_avoid"]:
+                print(f"       ❌ AVOID: {' | '.join(v['why_avoid'][:2])}")
+            if v["why_wait"]:
+                print(f"       ⏳ WAIT: {' | '.join(v['why_wait'][:2])}")
+            print(f"       Signals: {' | '.join(v['primary_signals'][:3])}")
+
+        if not alerts:
+            print(f"  No signals passed quality gates for this horizon.")
+
+    # Strategy attribution
+    attr=bt.get("strategy_attribution",{})
+    if attr:
+        print(f"\n{'═'*60}")
+        print(f"  STRATEGY ATTRIBUTION (What's Working / What's Not)")
+        print(f"{'═'*60}")
+        sorted_attr=sorted(attr.items(),key=lambda x:-x[1].get("total_pnl",0))
+        for sig,vals in sorted_attr[:10]:
+            status=vals.get("status","NEUTRAL")
+            emoji="🔥" if status=="HOT" else "❄️" if status=="COLD" else "➖"
+            print(f"  {emoji} {sig:<25} | WinRate: {vals['winrate']:.1%} | Trades: {vals['trades']} | P&L: ₹{vals['total_pnl']:,.0f} | Avg: ₹{vals['avg_pnl']:,.0f} | {status}")
+    print(f"\n{SEP}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §14  MAIN ORCHESTRATION
+# §10  MAIN ORCHESTRATION
 # ══════════════════════════════════════════════════════════════════════════════
-def run(cfg:Cfg, run_multibagger:bool=False)->tuple:
+def run(cfg:Cfg)->tuple:
     cfg.output_dir.mkdir(parents=True,exist_ok=True)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s | %(levelname)-8s | %(message)s",
                         handlers=[logging.StreamHandler(sys.stdout),
-                                  logging.FileHandler(cfg.output_dir/"nse_v12.log")])
+                                  logging.FileHandler(cfg.output_dir/"nse_v13.log")])
     for nm in ("yfinance","urllib3","requests","charset_normalizer"):
         logging.getLogger(nm).setLevel(logging.CRITICAL)
     t0=time.time()
@@ -1209,8 +1180,8 @@ def run(cfg:Cfg, run_multibagger:bool=False)->tuple:
         _con.print(Rule(characters="═", style="bright_cyan"))
         _con.print(Align.center(
             "[bold bright_white on #003366]"
-            "   NSE SWING TRADER v12.0  ·  DUAL ENGINE   "
-            "·  SWING (2-20D) + MULTIBAGGER (3-10Y)   "
+            "   NSE THREE-HORIZON TRADER v13.0   "
+            "·  SHORT · MID · LONG  ·  VERDICT ENGINE   "
             "[/bold bright_white on #003366]"))
         _con.print(Align.center(
             f"[dim]  {datetime.now().strftime('%A, %d %B %Y  |  %H:%M IST')}  "
@@ -1245,15 +1216,13 @@ def run(cfg:Cfg, run_multibagger:bool=False)->tuple:
         _con.print(f"[bold blue]Nifty50:[/bold blue] ₹{latest_nifty.get('last',0):.0f} "
                    f"{latest_nifty.get('label','N/A')} RSI:{latest_nifty.get('rsi',50):.0f} "
                    f"1M:{latest_nifty.get('chg_1m',0):+.1f}% 3M:{latest_nifty.get('chg_3m',0):+.1f}%")
-        if latest_nifty.get("trend",0)<=-0.5:
-            _con.print(f"[bold red]Bear market — threshold raised to {threshold:.2f}[/bold red]\n")
-        else: _con.print()
 
-    # ── SWING ENGINE ──
+    # Fetch data
     syms=cfg.symbols if cfg.symbols else _ALL_SYMS
     syms=sorted(set(syms)-_SKIP_SYMBOLS)
-    if _HAS_RICH: _con.print(f"[dim]Swing scan: {len(syms)} symbols...[/dim]\n")
+    if _HAS_RICH: _con.print(f"[dim]Fetching {len(syms)} symbols...[/dim]\n")
     all_frames=[]; fund_cache={}; ok=0; fail=0
+
     if _HAS_YF:
         def _fetch(sym):
             nonlocal ok,fail
@@ -1267,7 +1236,7 @@ def run(cfg:Cfg, run_multibagger:bool=False)->tuple:
             with Progress(SpinnerColumn(),TextColumn("[progress.description]{task.description}"),
                           BarColumn(bar_width=24),TextColumn("{task.completed}/{task.total}"),
                           TimeElapsedColumn(),console=_con) as prog:
-                task=prog.add_task("[cyan]Swing scanning...",total=len(syms))
+                task=prog.add_task("[cyan]Fetching NSE data...",total=len(syms))
                 for sym in syms:
                     prog.update(task,description=f"[cyan][bold]{sym:<14}[/bold]")
                     _fetch(sym); prog.advance(task)
@@ -1276,91 +1245,104 @@ def run(cfg:Cfg, run_multibagger:bool=False)->tuple:
                 if i%20==0: LOG.info("Progress: %d/%d ok:%d fail:%d",i,len(syms),ok,fail)
                 _fetch(sym)
     else:
-        LOG.error("yfinance not available"); return [], {}, latest_nifty, []
+        LOG.error("yfinance not available"); return {}, {}, latest_nifty
 
     if not all_frames: raise ValueError("No price data loaded.")
     prices=pd.concat(all_frames,ignore_index=True)
     prices=(prices.sort_values(["symbol","date"]).drop_duplicates(["date","symbol"],keep="last").reset_index(drop=True))
     LOG.info("Loaded %d bars across %d symbols.",len(prices),prices["symbol"].nunique())
 
+    # Feature engineering
+    if _HAS_RICH: _con.print("[dim]Computing indicators...[/dim]")
     feat=engineer_all(prices,cfg)
     if feat.empty: raise ValueError("Feature engineering returned empty frame.")
+
+    # Score with rolling regime
     feat=add_scores(feat,cfg,nifty_by_date,use_fundamentals=False)
-    bt=run_backtest(feat,cfg,nifty_by_date)
-    alerts,rej=build_alerts(feat,latest_nifty,fund_cache,cfg)
+
+    # Backtest (mid-term as default)
+    if _HAS_RICH: _con.print("[dim]Running backtest with realistic fills...[/dim]")
+    bt=run_backtest(feat,cfg,nifty_by_date,horizon="mid")
+
+    # Three-horizon alerts
+    if _HAS_RICH: _con.print("[dim]Building three-horizon verdicts...[/dim]")
+    results,rej=build_three_horizon_alerts(feat,latest_nifty,fund_cache,cfg)
     elapsed=round(time.time()-t0,1)
 
     if _HAS_RICH:
-        _con.print(f"\n[dim]Swing scan: {elapsed}s | Fetched:{ok} Skipped:{fail} Alerts:{len(alerts)} Rejected:{dict(rej)}[/dim]\n")
+        total_signals=sum(len(v) for v in results.values())
+        _con.print(f"\n[dim]Done in {elapsed}s | Fetched:{ok} Failed:{fail} | Signals:{total_signals}[/dim]\n")
 
-    # ── MULTIBAGGER ENGINE ──
-    mb_results=[]
-    if run_multibagger:
-        if _HAS_RICH: _con.print(f"[dim]Multibagger scan: {len(syms)} symbols...[/dim]\n")
-        mb_results=run_multibagger_scan(cfg,syms)
-        if _HAS_RICH: _con.print(f"[dim]Multibagger scan: {len(mb_results)} candidates[/dim]\n")
-
-    save_all(alerts,bt,latest_nifty,cfg,mb_results)
+    save_all(results,bt,latest_nifty,cfg)
 
     if not _HAS_RICH:
-        plain_report(alerts,latest_nifty,bt,cfg,mb_results)
-        return alerts,bt,latest_nifty,mb_results
+        plain_report(results,latest_nifty,bt,cfg)
+        return results,bt,latest_nifty
 
-    if not alerts:
-        _con.print("[bold yellow]  No swing signals passed quality gates.[/bold yellow]")
-        _con.print("[dim]  Try: --threshold 0.18 or lower --min-vol[/dim]")
-    else:
+    if _HAS_RICH:
+        for hname in ["short","mid","long"]:
+            hcfg=getattr(cfg, f"{hname}_cfg")
+            alerts=results.get(hname,[])
+            _con.print(Rule(characters="═", style="bright_cyan"))
+            _con.print(Align.center(f"[bold bright_cyan] {hcfg.label.upper()} [/bold bright_cyan]"))
+            _con.print(Rule(characters="═", style="bright_cyan"))
+            if not alerts:
+                _con.print("[dim]  No signals passed quality gates.[/dim]")
+                continue
+            for i,r in enumerate(alerts[:cfg.top_n],1):
+                v=r["verdict"]; l=r["levels"]
+                col={"BUY":"bold bright_green","WATCH":"bold yellow","WAIT":"bold orange3","AVOID":"bold red"}.get(v["verdict"],"dim")
+                _con.print(f"  [{col}]{v['verdict']:<6}[/{col}] #{i} {r['symbol']:<12} ₹{r['last_close']:>8,.2f}  "
+                           f"Score:{r['score']:+.3f}  Conf:{v['confidence']}%  "
+                           f"Entry:₹{l['entry']:,.2f}→₹{l['tp']:,.2f}  SL:₹{l['sl']:,.2f}  {l['rr_str']}")
+                if v["why_buy"]:
+                    _con.print(f"       [green]✓ {' | '.join(v['why_buy'][:2])}[/green]")
+                if v["why_avoid"]:
+                    _con.print(f"       [red]✗ {' | '.join(v['why_avoid'][:2])}[/red]")
+
+        # Attribution
+        attr=bt.get("strategy_attribution",{})
+        if attr:
+            _con.print(Rule(characters="═", style="bright_magenta"))
+            _con.print(Align.center("[bold bright_magenta] STRATEGY ATTRIBUTION [/bold bright_magenta]"))
+            _con.print(Rule(characters="═", style="bright_magenta"))
+            sorted_attr=sorted(attr.items(),key=lambda x:-x[1].get("total_pnl",0))
+            for sig,vals in sorted_attr[:10]:
+                status=vals.get("status","NEUTRAL")
+                col="bright_green" if status=="HOT" else "red" if status=="COLD" else "yellow"
+                _con.print(f"  [{col}]{status:<6}[/{col}] {sig:<25} WR:{vals['winrate']:.1%}  "
+                           f"Trades:{vals['trades']}  P&L:₹{vals['total_pnl']:>10,.0f}  Avg:₹{vals['avg_pnl']:>8,.0f}")
+
         _con.print(Rule(characters="═", style="bright_cyan"))
         _con.print(Align.center(
-            f"[bold bright_cyan] MARKET: {latest_nifty.get('label','N/A')} | "
-            f"Nifty ₹{latest_nifty.get('last',0):,.2f} | "
-            f"BT Return: {bt.get('ret',0):+.2%} | Sharpe: {bt.get('sharpe',0):.3f} | MaxDD: {bt.get('maxdd',0):.2%} [/bold bright_cyan]"))
+            f"[bold bright_cyan] ✅ v13.0 | {sum(len(v) for v in results.values())} signals | "
+            f"{datetime.now().strftime('%d %b %Y %H:%M IST')} | {elapsed:.1f}s [/bold bright_cyan]"))
         _con.print(Rule(characters="═", style="bright_cyan"))
-        for i,r in enumerate(alerts[:cfg.top_n],1):
-            conf=r["model"]; st=r["levels"]["short_term"]
-            _con.print(f"[bold bright_green]#{i} {r['symbol']}[/bold bright_green] "
-                       f"₹{r['last_close']:,.2f} | Model:{conf['model_pct']:.1f}% | "
-                       f"ST Target ₹{st['tp']:,.2f} | R:R {st['rr_str']} | {r['indices']}")
-        if mb_results:
-            _con.print()
-            _con.print(Rule(characters="═", style="bright_magenta"))
-            _con.print(Align.center("[bold bright_magenta] MULTIBAGGER CANDIDATES (3-10 year horizon) [/bold bright_magenta]"))
-            _con.print(Rule(characters="═", style="bright_magenta"))
-            for i,m in enumerate(mb_results[:10],1):
-                _con.print(f"[bold bright_yellow]#{i} {m['symbol']}[/bold bright_yellow] "
-                           f"Score: {m['score']}/100 | {m['category']} | "
-                           f"₹{m['current_price']:,.2f} | MCap ₹{m['mcap_cr']:,.0f} Cr")
-    _con.print(Rule(characters="═", style="bright_cyan"))
-    _con.print(Align.center(
-        f"[bold bright_cyan] ✅ v12.0 | Swing: {len(alerts)} | Multibagger: {len(mb_results)} | "
-        f"{datetime.now().strftime('%d %b %Y %H:%M IST')} | {elapsed:.1f}s [/bold bright_cyan]"))
-    _con.print(Rule(characters="═", style="bright_cyan"))
-    _con.print()
-    return alerts,bt,latest_nifty,mb_results
+        _con.print()
+
+    return results,bt,latest_nifty
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §15  CLI
+# §11  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     p=argparse.ArgumentParser(
-        description="NSE Swing Trader v12.0 — Swing (2-20D) + Multibagger (3-10Y) Dual Engine",
+        description="NSE Three-Horizon Trader v13.0 — Short/Mid/Long with Verdicts",
         formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--symbols", type=str, default="", help="Comma-separated NSE symbols")
-    p.add_argument("--group", type=str, default="", help="Index group: 'NIFTY BANK', 'FO STOCKS', etc.")
-    p.add_argument("--top-n", type=int, default=10)
-    p.add_argument("--output-dir", type=Path, default=Path("nse_v12_output"))
+    p.add_argument("--group", type=str, default="", help="Index group")
+    p.add_argument("--top-n", type=int, default=12)
+    p.add_argument("--output-dir", type=Path, default=Path("nse_v13_output"))
     p.add_argument("--period", type=str, default="8mo")
-    p.add_argument("--min-vol", type=int, default=750_000)
-    p.add_argument("--min-rr", type=float, default=1.2)
+    p.add_argument("--min-vol", type=int, default=500_000)
     p.add_argument("--threshold", type=float, default=0.16)
-    p.add_argument("--no-fund", action="store_true", help="Skip fundamentals (faster)")
+    p.add_argument("--no-fund", action="store_true", help="Skip fundamentals")
     p.add_argument("--capital", type=float, default=1_000_000)
-    p.add_argument("--multibagger", action="store_true", help="Run multibagger discovery scan")
     a=p.parse_args()
 
     cfg=Cfg()
     cfg.output_dir=a.output_dir; cfg.live_period=a.period; cfg.top_n=a.top_n
-    cfg.min_avg_vol=a.min_vol; cfg.min_rr=a.min_rr; cfg.base_threshold=a.threshold
+    cfg.min_avg_vol=a.min_vol; cfg.base_threshold=a.threshold
     cfg.fetch_fundamentals=not a.no_fund; cfg.capital=a.capital
 
     if a.symbols:
@@ -1373,377 +1355,400 @@ def main():
         else:
             print(f"Group '{a.group}' not found. Available: {list(_UNIVERSE.keys())}")
             sys.exit(1)
-    run(cfg, run_multibagger=a.multibagger)
+    run(cfg)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §16  STREAMLIT DASHBOARD  (Swing + Multibagger tabs)
+# §12  STREAMLIT DASHBOARD  (Rich, detailed, three-horizon, verdicts, attribution)
 # ══════════════════════════════════════════════════════════════════════════════
-def _d_grade(pct:float)->tuple:
-    if pct>=88: return "A+","#26a69a"
-    if pct>=78: return "A","#4db6ac"
-    if pct>=68: return "B+","#f59e0b"
-    if pct>=58: return "B","#fbbf24"
-    if pct>=48: return "C+","#ef5350"
-    return "C","#e53935"
 
-def _d_rsi_col(r):
-    if r<30: return "#26a69a"
-    if r<45: return "#4db6ac"
-    if r<60: return "#f59e0b"
-    if r<75: return "#ffa726"
-    return "#ef5350"
+def _verdict_color(v: str) -> str:
+    return {"BUY":"#26a69a","WATCH":"#f59e0b","WAIT":"#f97316","AVOID":"#ef5350"}.get(v,"#787b86")
 
-def run_dashboard(alerts_in, bt_in, nifty_in, mb_results_in):
-    alerts=alerts_in or []; bt=bt_in or {}; nifty=nifty_in or {}; mb_results=mb_results_in or []
-    trend=nifty.get("trend",0); last=nifty.get("last",0); rsi_n=nifty.get("rsi",50)
-    chg1m=nifty.get("chg_1m",0); lbl=nifty.get("label","N/A")
-    nt_col="#26a69a" if trend>=0.5 else "#ef5350" if trend<=-0.5 else "#f59e0b"
-    avg_model=sum(r["model"]["model_pct"] for r in alerts)/max(len(alerts),1)
-    n_fo=sum(1 for r in alerts if r.get("is_fo"))
-    bt_ret=bt.get("ret",0); bt_sh=bt.get("sharpe",0); bt_dd=bt.get("maxdd",0)
-    bt_wr=bt.get("winrate",0); bt_tr=bt.get("trades",0)
+def _verdict_bg(v: str) -> str:
+    return {"BUY":"#26a69a15","WATCH":"#f59e0b15","WAIT":"#f9731615","AVOID":"#ef535015"}.get(v,"#787b8615")
+
+def _verdict_emoji(v: str) -> str:
+    return {"BUY":"🟢","WATCH":"🟡","WAIT":"🟠","AVOID":"🔴"}.get(v,"⚪")
+
+def run_dashboard(results: dict, bt: dict, nifty: dict):
+    alerts_short = results.get("short", [])
+    alerts_mid = results.get("mid", [])
+    alerts_long = results.get("long", [])
+
+    trend = nifty.get("trend", 0)
+    last = nifty.get("last", 0)
+    rsi_n = nifty.get("rsi", 50)
+    chg1m = nifty.get("chg_1m", 0)
+    lbl = nifty.get("label", "N/A")
+
+    bt_ret = bt.get("ret", 0)
+    bt_sh = bt.get("sharpe", 0)
+    bt_dd = bt.get("maxdd", 0)
+    bt_wr = bt.get("winrate", 0)
+    bt_tr = bt.get("trades", 0)
 
     st.markdown("""
     <style>
-    .stApp{background:#0b0e11;color:#d1d4dc;font-family:'Segoe UI',sans-serif;}
-    [data-testid="stMetricContainer"]{background:#131722;border:1px solid #2a3347;border-radius:4px;padding:12px;}
+    .stApp { background: #0b0e11; color: #d1d4dc; font-family: 'Segoe UI', sans-serif; }
+    [data-testid="stMetricContainer"] { background: #131722; border: 1px solid #2a3347; border-radius: 4px; padding: 12px; }
+    .verdict-card { border-radius: 6px; padding: 16px; margin-bottom: 12px; border-left: 4px solid; }
+    .signal-pill { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.68rem; font-weight: 600; margin: 2px; }
     </style>
     """, unsafe_allow_html=True)
 
     # Header
-    c1,c2,c3,c4,c5=st.columns(5)
-    c1.metric("Nifty50",f"₹{last:,.0f}",f"{lbl}")
-    c2.metric("1M Change",f"{chg1m:+.2f}%")
-    c3.metric("🟢 Swing Signals",f"{len(alerts)}",f"F&O: {n_fo}")
-    c4.metric("📊 BT Return",f"{bt_ret:+.2%}")
-    c5.metric("📐 Sharpe",f"{bt_sh:.3f}")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Nifty50", f"₹{last:,.0f}", f"{lbl}")
+    c2.metric("1M Change", f"{chg1m:+.2f}%")
+    c3.metric("🟢 Signals", f"{len(alerts_short)+len(alerts_mid)+len(alerts_long)}")
+    c4.metric("📊 BT Return", f"{bt_ret:+.2%}")
+    c5.metric("📐 Sharpe", f"{bt_sh:.3f}")
 
-    tabs=st.tabs([
-        "📈 Swing Trades (2-20 Days)",
-        "🚀 Multibagger Discovery (3-10 Years)",
-        "📊 Backtest Integrity",
-        "🔍 Sector Scan",
+    tabs = st.tabs([
+        "⚡ Short Term (2–7 Days)",
+        "📅 Mid Term (1–3 Months)",
+        "🏛️ Long Term (6–12+ Months)",
+        "📊 Strategy Attribution",
+        "📈 Backtest Integrity",
     ])
 
     # ══════════════════════════════════════════════════════════════════════
-    # TAB 0 — SWING TRADES
+    # TAB 0 — SHORT TERM
     # ══════════════════════════════════════════════════════════════════════
     with tabs[0]:
+        _render_horizon_tab(alerts_short, "short", cfg)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB 1 — MID TERM
+    # ══════════════════════════════════════════════════════════════════════
+    with tabs[1]:
+        _render_horizon_tab(alerts_mid, "mid", cfg)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB 2 — LONG TERM
+    # ══════════════════════════════════════════════════════════════════════
+    with tabs[2]:
+        _render_horizon_tab(alerts_long, "long", cfg)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TAB 3 — STRATEGY ATTRIBUTION
+    # ══════════════════════════════════════════════════════════════════════
+    with tabs[3]:
         st.markdown("""
-        <div style='background:#131722;padding:14px 20px;border-left:4px solid #26a69a;border-radius:6px;margin-bottom:16px'>
-          <div style='font-family:Syne,sans-serif;font-weight:800;font-size:1.2rem;color:#26a69a'>
-            📈 SWING TRADE SIGNALS — 2 to 20 Trading Days
+        <div style='background:#131722;padding:16px 20px;border-left:4px solid #a855f7;border-radius:6px;margin-bottom:16px'>
+          <div style='font-family:Syne,sans-serif;font-weight:800;font-size:1.2rem;color:#a855f7'>
+            📊 STRATEGY ATTRIBUTION — What's Working vs What's Not
           </div>
           <div style='font-size:.76rem;color:#787b86;margin-top:4px'>
-            ATR-based stops · 1% risk per trade · Correlation guard · Daily bars only · NOT intraday
+            Tracks which signal types generated winning vs losing trades in the backtest.
+            HOT = making money. COLD = losing money. Adjust your weights accordingly.
           </div>
         </div>""", unsafe_allow_html=True)
 
-        if not alerts:
-            st.warning("No swing signals passed quality gates. Try lowering threshold or min-vol.")
+        attr = bt.get("strategy_attribution", {})
+        if not attr:
+            st.info("Run a backtest to see strategy attribution data.")
         else:
-            # Top signals table
-            rows=[]
-            for r in alerts[:20]:
-                conf=r["model"]; mk=r["mkt"]; stl=r["levels"]["short_term"]; ltl=r["levels"]["long_term"]
-                ltr,_=_d_grade(conf["model_pct"])
-                rows.append({
-                    "Symbol":r["symbol"],"Grade":ltr,"Model%":round(conf["model_pct"],1),
-                    "Score":round(r["score"],4),"RSI":r["rsi"],"ADX":r["adx"],
-                    "Vol×":r["vol_ratio"],"ATR%":r["atr_pct"],"F&O":"✅" if r["is_fo"] else "—",
-                    "Price ₹":r["last_close"],"ST Target ₹":stl["tp"],"ST SL ₹":stl["sl"],
-                    "ST R:R":stl["rr_str"],"LT Target ₹":ltl["tp"],"LT R:R":ltl["rr_str"],
-                    "Top Signal":r["hits"][0][1] if r["hits"] else "—","Indices":r["indices"],
+            sorted_attr = sorted(attr.items(), key=lambda x: -x[1].get("total_pnl", 0))
+
+            # Summary metrics
+            hot_count = sum(1 for _, v in sorted_attr if v.get("status") == "HOT")
+            cold_count = sum(1 for _, v in sorted_attr if v.get("status") == "COLD")
+            total_pnl = sum(v.get("total_pnl", 0) for _, v in sorted_attr)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("🔥 HOT Strategies", f"{hot_count}")
+            m2.metric("❄️ COLD Strategies", f"{cold_count}")
+            m3.metric("Total Trades", f"{sum(v.get('trades',0) for _,v in sorted_attr)}")
+            m4.metric("Net P&L", f"₹{total_pnl:,.0f}")
+
+            # Attribution table
+            attr_rows = []
+            for sig, vals in sorted_attr:
+                attr_rows.append({
+                    "Signal Type": sig.replace("_", " ").title(),
+                    "Status": vals.get("status", "NEUTRAL"),
+                    "Trades": vals.get("trades", 0),
+                    "Wins": vals.get("wins", 0),
+                    "Losses": vals.get("losses", 0),
+                    "Win Rate": f"{vals.get('winrate',0):.1%}",
+                    "Total P&L ₹": vals.get("total_pnl", 0),
+                    "Avg P&L ₹": vals.get("avg_pnl", 0),
                 })
-            df=pd.DataFrame(rows)
-            st.dataframe(df,use_container_width=True,height=500,
-                         column_config={
-                             "Model%":st.column_config.ProgressColumn("Model%",min_value=0,max_value=100,format="%.1f%%"),
-                             "Price ₹":st.column_config.NumberColumn("Price ₹",format="₹%.2f"),
-                             "ST Target ₹":st.column_config.NumberColumn("ST Tgt",format="₹%.2f"),
-                             "ST SL ₹":st.column_config.NumberColumn("ST SL",format="₹%.2f"),
-                             "LT Target ₹":st.column_config.NumberColumn("LT Tgt",format="₹%.2f"),
-                         })
-            csv=df.to_csv(index=False).encode()
-            st.download_button("⬇️ Download Swing Signals CSV",data=csv,
-                               file_name=f"swing_signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",mime="text/csv")
 
-            # Signal cards
-            st.markdown("<div style='margin-top:20px'></div>",unsafe_allow_html=True)
-            for i,r in enumerate(alerts[:10],1):
-                conf=r["model"]; mk=r["mkt"]; stl=r["levels"]["short_term"]; ltl=r["levels"]["long_term"]
-                ltr,gc=_d_grade(conf["model_pct"]); up=(stl["tp"]/stl["entry"]-1)*100
-                with st.expander(f"#{i}  {r['symbol']}  ·  Grade {ltr}  ·  Model {conf['model_pct']:.1f}%  ·  ₹{r['last_close']:,.2f}  →  ST ₹{stl['tp']:,.2f} ({up:+.1f}%)",expanded=(i==1)):
-                    cA,cB,cC=st.columns(3)
-                    cA.metric("Price",f"₹{r['last_close']:,.2f}")
-                    cB.metric("Model Score",f"{conf['model_pct']:.1f}%",f"Grade {ltr}")
-                    cC.metric("Market Align",f"{mk['pct']:.1f}%",mk['align'])
-                    st.markdown(f"**Sector:** {r.get('sector','N/A')}  ·  **Industry:** {r.get('industry','N/A')}  ·  **Indices:** {r['indices']}")
-                    st.markdown(f"**Research Note:** {r['reason']}")
-                    t1,t2,t3=st.columns(3)
-                    t1.markdown(f"""
-                    <div style='background:#131722;padding:12px;border-radius:4px;border-left:3px solid #f59e0b'>
-                    <b>⚡ Aggressive (ST)</b><br>
-                    Entry: ₹{stl['entry']:,.2f}<br>
-                    Target: ₹{stl['tp']:,.2f} <span style='color:#26a69a'>(+{up:.1f}%)</span><br>
-                    Stop: ₹{stl['sl']:,.2f} <span style='color:#ef5350'>({(stl['sl']/stl['entry']-1)*100:.1f}%)</span><br>
-                    R:R {stl['rr_str']} · {stl['window']}
-                    </div>""",unsafe_allow_html=True)
-                    t2.markdown(f"""
-                    <div style='background:#131722;padding:12px;border-radius:4px;border-left:3px solid #26a69a'>
-                    <b>📅 Swing (LT)</b><br>
-                    Entry: ₹{ltl['entry']:,.2f}<br>
-                    Target: ₹{ltl['tp']:,.2f} <span style='color:#26a69a'>(+{(ltl['tp']/ltl['entry']-1)*100:.1f}%)</span><br>
-                    Stop: ₹{ltl['sl']:,.2f} <span style='color:#ef5350'>({(ltl['sl']/ltl['entry']-1)*100:.1f}%)</span><br>
-                    R:R {ltl['rr_str']} · {ltl['window']}
-                    </div>""",unsafe_allow_html=True)
-                    # Position sizing
-                    cap=st.session_state.get("capital",1_000_000)
-                    risk=abs(stl['entry']-stl['sl'])
-                    if risk>0:
-                        qty_1p=int((cap*0.01)//risk); qty_20p=int((cap*0.20)//stl['entry'])
-                        qty=min(qty_1p,qty_20p)
-                    else: qty=0
-                    t3.markdown(f"""
-                    <div style='background:#131722;padding:12px;border-radius:4px;border-left:3px solid #38bdf8'>
-                    <b>💰 Position Sizing (1% Risk)</b><br>
-                    Capital: ₹{cap:,.0f}<br>
-                    Risk/Share: ₹{risk:.2f}<br>
-                    Qty: <b>{qty:,}</b><br>
-                    Deployed: ₹{qty*stl['entry']:,.0f}<br>
-                    Max Loss: ₹{qty*risk:,.0f}
-                    </div>""",unsafe_allow_html=True)
-                    # Patterns
-                    st.markdown("**Detected Patterns:**")
-                    ph=st.columns(4)
-                    for idx,(sc,lb,cat) in enumerate(r['hits'][:8]):
-                        ph[idx%4].markdown(f"<span style='color:#38bdf8'>▸</span> {lb} ({sc*100:.0f}%)",unsafe_allow_html=True)
+            attr_df = pd.DataFrame(attr_rows)
+            st.dataframe(attr_df, use_container_width=True, height=400,
+                        column_config={
+                            "Total P&L ₹": st.column_config.NumberColumn("Total P&L", format="₹%.0f"),
+                            "Avg P&L ₹": st.column_config.NumberColumn("Avg P&L", format="₹%.0f"),
+                        })
+
+            # Visual bars
+            st.markdown("<div style='margin-top:20px'></div>", unsafe_allow_html=True)
+            for sig, vals in sorted_attr[:15]:
+                status = vals.get("status", "NEUTRAL")
+                color = "#26a69a" if status == "HOT" else "#ef5350" if status == "COLD" else "#f59e0b"
+                emoji = "🔥" if status == "HOT" else "❄️" if status == "COLD" else "➖"
+                pnl = vals.get("total_pnl", 0)
+                max_pnl = max(abs(v.get("total_pnl", 0)) for _, v in sorted_attr) if sorted_attr else 1
+                bar_width = min(abs(pnl) / max_pnl * 300, 300) if max_pnl > 0 else 0
+                bar_color = "#26a69a" if pnl > 0 else "#ef5350"
+
+                st.markdown(f"""
+                <div style='display:flex;align-items:center;gap:12px;margin-bottom:8px;padding:8px 12px;background:#131722;border-radius:4px'>
+                  <div style='width:30px;text-align:center;font-size:1.2rem'>{emoji}</div>
+                  <div style='width:180px;font-size:.85rem;color:#d1d4dc;font-weight:600'>{sig.replace("_"," ").title()}</div>
+                  <div style='width:60px;font-size:.75rem;color:{color};font-weight:700'>{status}</div>
+                  <div style='flex:1;height:8px;background:#1c2030;border-radius:4px;overflow:hidden'>
+                    <div style='width:{bar_width}px;height:100%;background:{bar_color};border-radius:4px'></div>
+                  </div>
+                  <div style='width:100px;text-align:right;font-size:.8rem;color:{bar_color};font-weight:700'>₹{pnl:,.0f}</div>
+                  <div style='width:60px;text-align:right;font-size:.75rem;color:#787b86'>{vals.get('winrate',0):.0%} WR</div>
+                </div>
+                """, unsafe_allow_html=True)
 
     # ══════════════════════════════════════════════════════════════════════
-    # TAB 1 — MULTIBAGGER DISCOVERY
+    # TAB 4 — BACKTEST INTEGRITY
     # ══════════════════════════════════════════════════════════════════════
-    with tabs[1]:
-        st.markdown("""
-        <div style='background:linear-gradient(135deg,#a855f720,#0b0e11);padding:16px 20px;border-left:4px solid #a855f7;border-radius:6px;margin-bottom:16px'>
-          <div style='font-family:Syne,sans-serif;font-weight:800;font-size:1.2rem;color:#a855f7'>
-            🚀 MULTIBAGGER DISCOVERY — 3 to 10 Year Horizon
-          </div>
-          <div style='font-size:.76rem;color:#787b86;margin-top:4px;line-height:1.7'>
-            Scans for <b style='color:#d1d4dc'>small & mid-cap compounders</b> with 10×–100× potential.
-            Requires <b style='color:#ef5350'>50–70% drawdown tolerance</b>, 1–2% position size per bet,
-            and 15–20 stock diversification. <b style='color:#f59e0b'>90% of such bets fail.</b>
-            This is NOT swing trading. Hold through 3–5 year corrections.
-          </div>
-        </div>""",unsafe_allow_html=True)
-
-        if not mb_results:
-            st.info("👆 Run the multibagger scan from the sidebar or terminal with --multibagger flag.")
-            if st.button("🚀 Run Multibagger Scan",use_container_width=True):
-                with st.spinner("Scanning ~200 NSE symbols for multibagger potential... This may take 5-10 minutes."):
-                    cfg=Cfg()
-                    mb_results=run_multibagger_scan(cfg)
-                if mb_results:
-                    st.rerun()
-                else:
-                    st.warning("No multibagger candidates met the minimum score threshold (55/100).")
-        else:
-            # Summary KPIs
-            k1,k2,k3,k4,k5=st.columns(5)
-            k1.metric("Candidates",f"{len(mb_results)}")
-            k2.metric("Top Score",f"{mb_results[0]['score']}/100" if mb_results else "0")
-            k3.metric("Avg Score",f"{sum(m['score'] for m in mb_results)/max(len(mb_results),1):.1f}/100")
-            k4.metric("Small Caps",f"{sum(1 for m in mb_results if m['mcap_cr'] and m['mcap_cr']<5000)}")
-            k5.metric("Mid Caps",f"{sum(1 for m in mb_results if m['mcap_cr'] and 5000<=m['mcap_cr']<25000)}")
-
-            # Top candidates table
-            mb_rows=[]
-            for m in mb_results[:20]:
-                f=m["fundamentals"]
-                mb_rows.append({
-                    "Symbol":m["symbol"],"Score":m["score"],"Category":m["category"],
-                    "Price ₹":m["current_price"],"MCap ₹Cr":m["mcap_cr"],
-                    "Sector":m["sector"],"PE":f.get("pe"),"PEG":f.get("peg"),
-                    "ROE%":f.get("roe"),"Rev Growth%":f.get("rev_growth"),
-                    "EPS Growth%":f.get("eps_growth"),"Debt/Eq":f.get("debt_equity"),
-                    "Margin%":f.get("profit_margin"),"F&O":"✅" if m["is_fo"] else "—",
-                })
-            mb_df=pd.DataFrame(mb_rows)
-            st.dataframe(mb_df,use_container_width=True,height=400,
-                         column_config={
-                             "Score":st.column_config.ProgressColumn("Score",min_value=0,max_value=100,format="%.0f"),
-                             "Price ₹":st.column_config.NumberColumn("Price ₹",format="₹%.2f"),
-                             "MCap ₹Cr":st.column_config.NumberColumn("MCap ₹Cr",format="₹%.0f Cr"),
-                         })
-            mb_csv=mb_df.to_csv(index=False).encode()
-            st.download_button("⬇️ Download Multibagger CSV",data=mb_csv,
-                               file_name=f"multibagger_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",mime="text/csv")
-
-            # Detailed cards
-            st.markdown("<hr style='border-color:#2a3347;margin:16px 0'>",unsafe_allow_html=True)
-            st.markdown("<div style='font-family:Syne,sans-serif;font-weight:700;font-size:1rem;color:#a855f7;margin-bottom:12px'>🚀 INTERACTIVE MULTIBAGGER CARDS</div>",unsafe_allow_html=True)
-
-            for i,m in enumerate(mb_results[:10],1):
-                f=m["fundamentals"]; proj=m["projections"]
-                with st.expander(f"#{i}  {m['symbol']}  ·  Score {m['score']}/100  ·  {m['category']}  ·  ₹{m['current_price']:,.2f}  ·  MCap ₹{m['mcap_cr']:,.0f} Cr",expanded=(i==1)):
-                    # Header row
-                    h1,h2,h3,h4=st.columns(4)
-                    h1.metric("Score",f"{m['score']}/100")
-                    h2.metric("Current",f"₹{m['current_price']:,.2f}")
-                    h3.metric("Market Cap",f"₹{m['mcap_cr']:,.0f} Cr")
-                    h4.metric("Sector",m['sector'])
-
-                    # Thesis
-                    st.markdown(f"""
-                    <div style='background:#131722;padding:12px 16px;border-radius:4px;margin:8px 0'>
-                    <div style='color:#a855f7;font-weight:700;font-size:.9rem;margin-bottom:6px'>📋 INVESTMENT THESIS</div>
-                    <div style='font-size:.82rem;color:#d1d4dc;line-height:1.7'>
-                    {'<br>'.join(f'<span style="color:#26a69a">✓</span> {d}' for d in m['details'][:6])}
-                    </div>
-                    </div>""",unsafe_allow_html=True)
-
-                    if m['warnings']:
-                        st.markdown(f"""
-                        <div style='background:#ef535015;padding:10px 14px;border-radius:4px;border-left:3px solid #ef5350;margin:8px 0'>
-                        <div style='color:#ef5350;font-weight:700;font-size:.85rem;margin-bottom:4px'>⚠️ RISK FLAGS</div>
-                        <div style='font-size:.78rem;color:#d1d4dc'>
-                        {'<br>'.join(f'<span style="color:#ef5350">▸</span> {w}' for w in m['warnings'][:3])}
-                        </div>
-                        </div>""",unsafe_allow_html=True)
-
-                    # Projections (theoretical, not price targets)
-                    st.markdown(f"""
-                    <div style='background:#1c2030;padding:12px 16px;border-radius:4px;margin:10px 0'>
-                    <div style='color:#38bdf8;font-weight:700;font-size:.9rem;margin-bottom:8px'>🔮 MARKET CAP PROJECTIONS (Theoretical — NOT Price Targets)</div>
-                    <div style='display:flex;gap:12px;flex-wrap:wrap;font-size:.8rem'>
-                    <div style='background:#131722;padding:8px 12px;border-radius:3px;text-align:center;min-width:80px'>
-                      <div style='color:#787b86;font-size:.7rem'>2×</div>
-                      <div style='color:#f59e0b;font-weight:700'>₹{proj['2x_mcap']:,.0f} Cr</div>
-                    </div>
-                    <div style='background:#131722;padding:8px 12px;border-radius:3px;text-align:center;min-width:80px'>
-                      <div style='color:#787b86;font-size:.7rem'>5×</div>
-                      <div style='color:#26a69a;font-weight:700'>₹{proj['5x_mcap']:,.0f} Cr</div>
-                    </div>
-                    <div style='background:#131722;padding:8px 12px;border-radius:3px;text-align:center;min-width:80px'>
-                      <div style='color:#787b86;font-size:.7rem'>10×</div>
-                      <div style='color:#26a69a;font-weight:700'>₹{proj['10x_mcap']:,.0f} Cr</div>
-                    </div>
-                    <div style='background:#131722;padding:8px 12px;border-radius:3px;text-align:center;min-width:80px'>
-                      <div style='color:#787b86;font-size:.7rem'>50×</div>
-                      <div style='color:#a855f7;font-weight:700'>₹{proj['50x_mcap']:,.0f} Cr</div>
-                    </div>
-                    <div style='background:#131722;padding:8px 12px;border-radius:3px;text-align:center;min-width:80px'>
-                      <div style='color:#787b86;font-size:.7rem'>100×</div>
-                      <div style='color:#a855f7;font-weight:700'>₹{proj['100x_mcap']:,.0f} Cr</div>
-                    </div>
-                    </div>
-                    <div style='font-size:.68rem;color:#434651;margin-top:6px'>
-                    These are market cap milestones assuming continued compounding. Stock price = Market Cap / Shares Outstanding.
-                    Actual returns depend on dilution, splits, and share count changes. NOT financial advice.
-                    </div>
-                    </div>""",unsafe_allow_html=True)
-
-                    # Fundamentals grid
-                    f1,f2,f3,f4,f5,f6=st.columns(6)
-                    f1.metric("P/E",f"{f.get('pe','N/A')}")
-                    f2.metric("Forward P/E",f"{f.get('forward_pe','N/A')}")
-                    f3.metric("PEG",f"{f.get('peg','N/A')}")
-                    f4.metric("ROE",f"{f.get('roe','N/A')}%")
-                    f5.metric("Rev Growth",f"{f.get('rev_growth','N/A')}%")
-                    f6.metric("EPS Growth",f"{f.get('eps_growth','N/A')}%")
-
-                    # Position sizing guidance
-                    st.markdown(f"""
-                    <div style='background:#f59e0b15;padding:10px 14px;border-radius:4px;border-left:3px solid #f59e0b;margin:10px 0'>
-                    <div style='color:#f59e0b;font-weight:700;font-size:.85rem;margin-bottom:4px'>💡 POSITION SIZING GUIDANCE</div>
-                    <div style='font-size:.78rem;color:#d1d4dc;line-height:1.7'>
-                    • <b>Max 1–2% of portfolio per stock</b> (₹{(st.session_state.get('capital',1000000)*0.01):,.0f}–₹{(st.session_state.get('capital',1000000)*0.02):,.0f} on ₹{(st.session_state.get('capital',1000000)/1e5):.0f}L account)<br>
-                    • <b>Minimum 15–20 stocks</b> in a multibagger portfolio<br>
-                    • <b>Review quarterly</b>, not daily. Ignore 30–50% drawdowns.<br>
-                    • <b>Exit only if</b> thesis breaks (ROE collapses, debt spikes, management fraud)<br>
-                    • <b>Time horizon:</b> 3–10 years. 100× requires patience, not timing.
-                    </div>
-                    </div>""",unsafe_allow_html=True)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # TAB 2 — BACKTEST INTEGRITY
-    # ══════════════════════════════════════════════════════════════════════
-    with tabs[2]:
+    with tabs[4]:
         st.markdown("""
         <div style='background:#131722;padding:16px 20px;border-left:4px solid #f59e0b;border-radius:6px;margin-bottom:16px'>
           <div style='font-family:Syne,sans-serif;font-weight:800;font-size:1.2rem;color:#f59e0b'>
-            📊 BACKTEST INTEGRITY DECLARATION
+            📈 BACKTEST INTEGRITY DECLARATION
           </div>
           <div style='font-size:.76rem;color:#787b86;margin-top:4px;line-height:1.7'>
-            The swing backtest below uses <b>only lagged price data</b>. No fundamentals leak into history.
-            Stops execute against daily <b>low/high</b> with gap-fill logic. Position sizing is <b>1% risk-based</b>.
-            Correlation guard blocks >0.70 correlated picks. Survivorship filter excludes stocks with incomplete history.
+            • <b style='color:#d1d4dc'>No look-ahead bias</b> — fundamentals banned from historical scoring<br>
+            • <b style='color:#d1d4dc'>Realistic fills</b> — stops execute against daily low/high, not close<br>
+            • <b style='color:#d1d4dc'>1% risk per trade</b> — volatility-targeted sizing, not fixed allocation<br>
+            • <b style='color:#d1d4dc'>Correlation guard</b> — blocks >0.70 correlated picks<br>
+            • <b style='color:#d1d4dc'>Survivorship filter</b> — excludes stocks with incomplete history<br>
+            • <b style='color:#d1d4dc'>Strategy attribution</b> — tracks which signals actually make money
           </div>
-        </div>""",unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
 
-        b1,b2,b3,b4,b5,b6=st.columns(6)
-        b1.metric("Return",f"{bt_ret:+.2%}")
-        b2.metric("Sharpe",f"{bt_sh:.3f}")
-        b3.metric("Max DD",f"{bt_dd:.2%}")
-        b4.metric("Win Rate",f"{bt_wr:.1%}")
-        b5.metric("Trades",f"{bt_tr}")
-        b6.metric("Final Equity",f"₹{bt.get('final',0):,.0f}")
+        b1, b2, b3, b4, b5, b6 = st.columns(6)
+        b1.metric("Return", f"{bt_ret:+.2%}")
+        b2.metric("Sharpe", f"{bt_sh:.3f}")
+        b3.metric("Max DD", f"{bt_dd:.2%}")
+        b4.metric("Win Rate", f"{bt_wr:.1%}")
+        b5.metric("Trades", f"{bt_tr}")
+        b6.metric("Final Equity", f"₹{bt.get('final',0):,.0f}")
 
-        eq_df=bt.get("equity_df",pd.DataFrame())
-        if not eq_df.empty and len(eq_df)>1:
-            fig=go.Figure()
-            fig.add_trace(go.Scatter(x=eq_df["date"],y=eq_df["equity"],mode="lines",
-                         line=dict(color="#26a69a",width=2),fill="tozeroy",fillcolor="rgba(38,166,154,0.08)"))
-            fig.add_hline(y=1_000_000,line_color="#434651",line_dash="dot")
-            fig.update_layout(height=350,paper_bgcolor="#131722",plot_bgcolor="#0b0e11",
-                              font=dict(color="#787b86"),margin=dict(l=0,r=0,t=10,b=0),
-                              xaxis=dict(showgrid=True,gridcolor="#2a3347"),
-                              yaxis=dict(showgrid=True,gridcolor="#2a3347",tickprefix="₹"),showlegend=False)
-            st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False})
+        eq_df = bt.get("equity_df", pd.DataFrame())
+        if not eq_df.empty and len(eq_df) > 1:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=eq_df["date"], y=eq_df["equity"], mode="lines",
+                         line=dict(color="#26a69a", width=2), fill="tozeroy", fillcolor="rgba(38,166,154,0.08)"))
+            fig.add_hline(y=1_000_000, line_color="#434651", line_dash="dot")
+            fig.update_layout(height=350, paper_bgcolor="#131722", plot_bgcolor="#0b0e11",
+                              font=dict(color="#787b86"), margin=dict(l=0, r=0, t=10, b=0),
+                              xaxis=dict(showgrid=True, gridcolor="#2a3347"),
+                              yaxis=dict(showgrid=True, gridcolor="#2a3347", tickprefix="₹"), showlegend=False)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-        trd_df=bt.get("trades_df",pd.DataFrame())
+        trd_df = bt.get("trades_df", pd.DataFrame())
         if not trd_df.empty:
             st.markdown("**Recent Trades:**")
-            st.dataframe(trd_df.sort_values("exit",ascending=False).head(20),use_container_width=True,height=300,
-                         column_config={"pnl":st.column_config.NumberColumn("P&L",format="₹%.0f"),
-                                        "ret":st.column_config.NumberColumn("Return",format="%.2f%%")})
+            st.dataframe(trd_df.sort_values("exit", ascending=False).head(20),
+                         use_container_width=True, height=300,
+                         column_config={
+                             "pnl": st.column_config.NumberColumn("P&L", format="₹%.0f"),
+                             "ret": st.column_config.NumberColumn("Return", format="%.2f%%"),
+                         })
 
-    # ══════════════════════════════════════════════════════════════════════
-    # TAB 3 — SECTOR SCAN
-    # ══════════════════════════════════════════════════════════════════════
-    with tabs[3]:
-        st.markdown("<div style='font-family:Syne,sans-serif;font-weight:700;font-size:1rem;color:#38bdf8;margin-bottom:12px'>🔍 SECTOR-WISE SWING SCAN</div>",unsafe_allow_html=True)
-        sec=st.selectbox("Sector",["All Sectors","NIFTY 50","NIFTY BANK","NIFTY IT","NIFTY ENERGY","NIFTY AUTO","NIFTY INFRA","FO STOCKS"])
-        thresh=st.slider("Threshold",0.08,0.30,0.14,0.01)
-        top_n_sec=st.slider("Max Results",5,30,10,1)
-        if st.button("🚀 Run Sector Scan",use_container_width=True):
-            with st.spinner("Scanning..."):
-                gk=None if sec=="All Sectors" else sec
-                matched=[]
-                if gk:
-                    matched=[sl for grp,sl in _UNIVERSE.items() if gk in grp.upper()]
-                syms=sorted({s for sub in matched for s in sub}-_SKIP_SYMBOLS) if matched else _ALL_SYMS
-                cfg=Cfg(); cfg.symbols=syms; cfg.base_threshold=thresh; cfg.top_n=top_n_sec; cfg.fetch_fundamentals=False
-                try:
-                    sc_alerts,sc_bt,sc_nifty,sc_mb=run(cfg)
-                    if sc_alerts:
-                        st.success(f"Found {len(sc_alerts)} swing signals")
-                        for r in sc_alerts[:top_n_sec]:
-                            stl=r["levels"]["short_term"]
-                            st.markdown(f"**{r['symbol']}** ₹{r['last_close']:,.2f} → ST ₹{stl['tp']:,.2f} (R:R {stl['rr_str']}) — {r['reason'][:120]}")
-                    else:
-                        st.info("No signals in this sector at current threshold.")
-                except Exception as e:
-                    st.error(f"Scan failed: {e}")
+
+def _render_horizon_tab(alerts: List[dict], horizon: str, cfg: Cfg):
+    """Render a single horizon tab with rich verdict cards."""
+    hcfg = getattr(cfg, f"{horizon}_cfg", cfg.mid_cfg)
+
+    st.markdown(f"""
+    <div style='background:linear-gradient(135deg,{_verdict_bg("BUY")},#0b0e11);padding:14px 20px;border-left:4px solid {_verdict_color("BUY")};border-radius:6px;margin-bottom:16px'>
+      <div style='font-family:Syne,sans-serif;font-weight:800;font-size:1.2rem;color:#d1d4dc'>
+        {hcfg.label}
+      </div>
+      <div style='font-size:.76rem;color:#787b86;margin-top:4px'>
+        {hcfg.description} | Threshold: {hcfg.threshold} | ATR SL: {hcfg.atr_sl_mult}× | ATR TP: {hcfg.atr_tp_mult}×
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    if not alerts:
+        st.warning(f"No {horizon}-term signals passed quality gates. Try lowering threshold or min-vol.")
+        return
+
+    # Summary table
+    rows = []
+    for r in alerts[:20]:
+        v = r["verdict"]; l = r["levels"]
+        rows.append({
+            "Symbol": r["symbol"], "Verdict": v["verdict"], "Conf": v["confidence"],
+            "Score": round(r["score"], 4), "RSI": r["rsi"], "ADX": r["adx"],
+            "Vol×": r["vol_ratio"], "ATR%": r["atr_pct"], "F&O": "✅" if r["is_fo"] else "—",
+            "Price ₹": r["last_close"], "Entry ₹": l["entry"], "Target ₹": l["tp"],
+            "Stop ₹": l["sl"], "R:R": l["rr_str"], "Window": l["window"],
+            "Top Signal": " | ".join(v["primary_signals"][:2]),
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, height=400,
+                 column_config={
+                     "Conf": st.column_config.ProgressColumn("Conf", min_value=0, max_value=100, format="%.0f%%"),
+                     "Price ₹": st.column_config.NumberColumn("Price", format="₹%.2f"),
+                     "Entry ₹": st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                     "Target ₹": st.column_config.NumberColumn("Target", format="₹%.2f"),
+                     "Stop ₹": st.column_config.NumberColumn("Stop", format="₹%.2f"),
+                 })
+
+    csv = df.to_csv(index=False).encode()
+    st.download_button(f"⬇️ Download {horizon.title()} CSV", data=csv,
+                       file_name=f"{horizon}_signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                       mime="text/csv")
+
+    st.markdown("<hr style='border-color:#2a3347;margin:16px 0'>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-family:Syne,sans-serif;font-weight:700;font-size:1rem;color:#38bdf8;margin-bottom:12px'>📋 DETAILED VERDICT CARDS — {horizon.upper()} TERM</div>", unsafe_allow_html=True)
+
+    # Verdict cards
+    for i, r in enumerate(alerts[:cfg.top_n], 1):
+        v = r["verdict"]; l = r["levels"]
+        vc = _verdict_color(v["verdict"])
+        vbg = _verdict_bg(v["verdict"])
+        ve = _verdict_emoji(v["verdict"])
+
+        with st.expander(
+            f"{ve} #{i} {r['symbol']} | {v['verdict']} ({v['confidence']}%) | ₹{r['last_close']:,.2f} → ₹{l['tp']:,.2f} | R:R {l['rr_str']}",
+            expanded=(i == 1 and v["verdict"] == "BUY")
+        ):
+            # Top row: verdict + price + metrics
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Verdict", v["verdict"], f"{v['confidence']}% confidence")
+            c2.metric("Price", f"₹{r['last_close']:,.2f}")
+            c3.metric("RSI", f"{r['rsi']:.1f}")
+            c4.metric("ADX", f"{r['adx']:.1f}")
+            c5.metric("Vol", f"{r['vol_ratio']:.2f}×")
+            c6.metric("ATR%", f"{r['atr_pct']:.2f}%")
+
+            # Trade plan
+            st.markdown(f"""
+            <div style='background:{vbg};border-left:4px solid {vc};border-radius:6px;padding:14px 18px;margin:12px 0'>
+              <div style='font-family:Syne,sans-serif;font-weight:700;font-size:1rem;color:{vc};margin-bottom:10px'>
+                📐 TRADE PLAN — {v['verdict']}
+              </div>
+              <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-size:.85rem'>
+                <div style='background:#131722;padding:10px;border-radius:4px;text-align:center'>
+                  <div style='color:#787b86;font-size:.7rem'>ENTRY</div>
+                  <div style='color:#38bdf8;font-weight:700;font-size:1.1rem'>₹{l['entry']:,.2f}</div>
+                </div>
+                <div style='background:#131722;padding:10px;border-radius:4px;text-align:center'>
+                  <div style='color:#787b86;font-size:.7rem'>TARGET</div>
+                  <div style='color:#26a69a;font-weight:700;font-size:1.1rem'>₹{l['tp']:,.2f}</div>
+                  <div style='color:#26a69a;font-size:.75rem'>+{(l['tp']/l['entry']-1)*100:.1f}%</div>
+                </div>
+                <div style='background:#131722;padding:10px;border-radius:4px;text-align:center'>
+                  <div style='color:#787b86;font-size:.7rem'>STOP LOSS</div>
+                  <div style='color:#ef5350;font-weight:700;font-size:1.1rem'>₹{l['sl']:,.2f}</div>
+                  <div style='color:#ef5350;font-size:.75rem'>{(l['sl']/l['entry']-1)*100:.1f}%</div>
+                </div>
+                <div style='background:#131722;padding:10px;border-radius:4px;text-align:center'>
+                  <div style='color:#787b86;font-size:.7rem'>RISK:REWARD</div>
+                  <div style='color:#d1d4dc;font-weight:700;font-size:1.1rem'>{l['rr_str']}</div>
+                  <div style='color:#787b86;font-size:.75rem'>{l['window']}</div>
+                </div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Position sizing
+            cap = st.session_state.get("capital", 1_000_000)
+            risk = abs(l['entry'] - l['sl'])
+            if risk > 0:
+                qty_1p = int((cap * 0.01) // risk)
+                qty_20p = int((cap * 0.20) // l['entry'])
+                qty = min(qty_1p, qty_20p)
+            else:
+                qty = 0
+
+            st.markdown(f"""
+            <div style='background:#1c2030;padding:10px 14px;border-radius:4px;margin:10px 0'>
+              <div style='color:#f59e0b;font-weight:700;font-size:.85rem;margin-bottom:6px'>💰 POSITION SIZING (1% Risk Rule)</div>
+              <div style='display:flex;gap:16px;font-size:.8rem;color:#d1d4dc'>
+                <div><b>Capital:</b> ₹{cap:,.0f}</div>
+                <div><b>Risk/Share:</b> ₹{risk:.2f}</div>
+                <div><b>Qty:</b> <span style='color:#38bdf8;font-weight:700'>{qty:,}</span> shares</div>
+                <div><b>Deployed:</b> ₹{qty*l['entry']:,.0f}</div>
+                <div><b>Max Loss:</b> <span style='color:#ef5350'>₹{qty*risk:,.0f}</span></div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Verdict rationale
+            col_buy, col_avoid, col_wait = st.columns(3)
+
+            with col_buy:
+                if v["why_buy"]:
+                    st.markdown(f"""
+                    <div style='background:#26a69a15;padding:10px 12px;border-radius:4px;border-left:3px solid #26a69a;height:100%'>
+                      <div style='color:#26a69a;font-weight:700;font-size:.85rem;margin-bottom:6px'>✅ WHY BUY</div>
+                      <div style='font-size:.78rem;color:#d1d4dc;line-height:1.7'>
+                      {'<br>'.join(f'<span style="color:#26a69a">▸</span> {b}' for b in v['why_buy'][:5])}
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='color:#434651;font-size:.78rem;padding:10px'>No strong buy signals</div>", unsafe_allow_html=True)
+
+            with col_avoid:
+                if v["why_avoid"]:
+                    st.markdown(f"""
+                    <div style='background:#ef535015;padding:10px 12px;border-radius:4px;border-left:3px solid #ef5350;height:100%'>
+                      <div style='color:#ef5350;font-weight:700;font-size:.85rem;margin-bottom:6px'>❌ WHY AVOID</div>
+                      <div style='font-size:.78rem;color:#d1d4dc;line-height:1.7'>
+                      {'<br>'.join(f'<span style="color:#ef5350">▸</span> {a}' for a in v['why_avoid'][:5])}
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='color:#434651;font-size:.78rem;padding:10px'>No major red flags</div>", unsafe_allow_html=True)
+
+            with col_wait:
+                if v["why_wait"]:
+                    st.markdown(f"""
+                    <div style='background:#f59e0b15;padding:10px 12px;border-radius:4px;border-left:3px solid #f59e0b;height:100%'>
+                      <div style='color:#f59e0b;font-weight:700;font-size:.85rem;margin-bottom:6px'>⏳ WHY WAIT</div>
+                      <div style='font-size:.78rem;color:#d1d4dc;line-height:1.7'>
+                      {'<br>'.join(f'<span style="color:#f59e0b">▸</span> {w}' for w in v['why_wait'][:5])}
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div style='color:#434651;font-size:.78rem;padding:10px'>No pending conditions</div>", unsafe_allow_html=True)
+
+            # Factor breakdown
+            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+            factors = v.get("factors", {})
+            if factors:
+                fcols = st.columns(4)
+                factor_items = list(factors.items())
+                for idx, (fname, fval) in enumerate(factor_items):
+                    fcol = "#26a69a" if fval > 0.3 else "#f59e0b" if fval > 0 else "#ef5350"
+                    fcols[idx % 4].markdown(f"""
+                    <div style='background:#131722;padding:8px 10px;border-radius:3px;margin-bottom:4px'>
+                      <div style='display:flex;justify-content:space-between;align-items:center'>
+                        <span style='font-size:.75rem;color:#787b86'>{fname.title()}</span>
+                        <span style='font-size:.8rem;color:{fcol};font-weight:700'>{fval:+.2f}</span>
+                      </div>
+                      <div style='height:3px;background:#1c2030;border-radius:2px;margin-top:4px;overflow:hidden'>
+                        <div style='width:{min(abs(fval)*100,100):.0f}%;height:100%;background:{fcol};border-radius:2px'></div>
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+
+            # Primary signals
+            st.markdown(f"""
+            <div style='margin-top:8px;font-size:.75rem;color:#787b86'>
+              <b style='color:#38bdf8'>Primary Signals:</b> {' · '.join(v['primary_signals'][:3])}
+            </div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §17  ENTRY POINT
+# §13  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
-if __name__=="__main__":
+if __name__ == "__main__":
     if _STREAMLIT:
-        cfg=Cfg()
+        cfg = Cfg()
         try:
-            alerts,bt,nifty,mb_results=run(cfg,run_multibagger=True)
-            run_dashboard(alerts,bt,nifty,mb_results)
+            results, bt, nifty = run(cfg)
+            run_dashboard(results, bt, nifty)
         except Exception as e:
             st.error(f"Engine error: {e}")
             LOG.exception("Streamlit run failed")
